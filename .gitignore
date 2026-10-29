@@ -1,0 +1,22 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+uv.lock
+
+# tooling
+.ruff_cache/
+
+# outputs and weights
+/outputs/
+*.ply
+*.safetensors
+*.pt
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
