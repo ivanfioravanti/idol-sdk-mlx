@@ -55,6 +55,16 @@ def test_repo_kernels():
     assert float(mx.linalg.norm((out - ref).flatten()) / mx.linalg.norm(ref.flatten())) < 1e-6
 
 
+def test_norm_mod_kernel():
+    norm = mlx_dit.nn.LayerNorm(1024, eps=1e-6, affine=False)
+    x = (mx.random.normal((2, 300, 1024)) * 3 + 1).astype(mx.float16)
+    scale, shift = [(mx.random.normal((2, 1, 1024)) * 0.3).astype(mx.float16) for _ in range(2)]
+    ref = (mlx_dit.norm32(norm, x) * (1 + scale) + shift).astype(mx.float32)
+    out = mlx_dit.norm_mod(x, scale, shift).astype(mx.float32)
+    assert float(mx.linalg.norm((out - ref).flatten()) / mx.linalg.norm(ref.flatten())) < 1e-4
+    print('norm_mod max abs diff', float(mx.abs(out - ref).max()), 'mismatch fraction', float((out != ref).mean()))
+
+
 def test_linear_full_fp32():
     layer = mlx_dit.Linear(1024, 512)
     x = mx.random.normal((4096, 1024))
@@ -66,5 +76,6 @@ if __name__ == '__main__':
     test_rope_rmsnorm_kernel()
     test_attention_kernel()
     test_repo_kernels()
+    test_norm_mod_kernel()
     test_linear_full_fp32()
     print('ok')

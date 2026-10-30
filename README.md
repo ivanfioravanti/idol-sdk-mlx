@@ -156,6 +156,10 @@ Profiled per component. Each change below was checked against the PyTorch FP32 r
 | Latent stream shared by both guidance passes | the noise refiner, time and camera embeddings do not see the condition | skips 2 blocks per step |
 | One precise matmul for each RePo layer's gate and content projections | halves the operand splits and matmul launches | |
 | `mx.compile` per pass, next step queued while the GPU runs the current one | | |
+| Own flash-attention Metal kernel for head_dim 64 | MLX's kernel gives each simdgroup 8 query rows and reloads Q and K fragments for every MMA; here 16 rows stay in registers, so each K / V fragment feeds two MMAs. Same FP32 online softmax; reads V from the qkv projection, writes the layout the output projection takes | attention 27.3 → 26.8 ms (12,294 tokens), 13.1 → 12.5 ms (8,195, with the key bias); sampling −1.2 to −3.4% |
+| FP16 linear weights stored transposed and contiguous | MLX's GEMM is ~5% faster on `[in, out]` weights than on the `weight.T` view | sampling −1.6% |
+| Fused RePo layer: one-pass LayerNorm kernel and one kernel from the gate / content projections to the angles | replaces a cast, a 48-output FP32 matmul and the elementwise ops around it; same FP32 math (angles agree to 2.5e-7) | RePo 1.17 → 0.82 ms per block; sampling −0.4% |
+| LayerNorm + adaLN modulation in one kernel | the cast, `mx.fast.layer_norm`, cast and multiply-add were three passes over the tokens; same FP16 rounding steps (1-ulp differences on 0.004% of values) | sampling −1.3% |
 
 Tried and dropped: running both guidance passes as one batch-2 forward (no faster in PyTorch MPS, slower in MLX:
 1.40 s against 2 x 0.61 s); bfloat16 kernels (attention as fast as float16, matmuls ~12% slower).

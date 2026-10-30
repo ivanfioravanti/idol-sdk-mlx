@@ -304,6 +304,46 @@ _repo_angles_kernel = mx.fast.metal_kernel(
 """)
 
 
+# norm32(LayerNorm without affine, eps 1e-6) then adaLN modulation, as one pass: LayerNorm in FP32, rounded to FP16,
+# then x * (1 + scale) + shift in FP16 arithmetic, as the separate MLX ops do (a cast, mx.fast.layer_norm, a cast and a
+# fused multiply-add: three passes over the tokens).
+_norm_mod_kernel = mx.fast.metal_kernel(
+    name='idol_norm_mod',
+    input_names=['x', 'scale', 'shift'],
+    output_names=['out'],
+    source="""
+    const uint t = threadgroup_position_in_grid.x, lid = thread_position_in_threadgroup.x;
+    const uint C = x_shape[2], b = t / x_shape[1], sg = lid / 32, lane = lid % 32;
+    threadgroup float part[8];
+    const float4 v = float4(*(const device half4*)(x + t * C + lid * 4));
+    float s = simd_sum(v.x + v.y + v.z + v.w);
+    if (lane == 0) part[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = 0;
+    for (int i = 0; i < 8; i++) mean += part[i];
+    mean /= C;
+    const float4 dv = v - mean;
+    s = simd_sum(dot(dv, dv));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) part[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float var = 0;
+    for (int i = 0; i < 8; i++) var += part[i];
+    const half4 y = half4(dv * metal::precise::rsqrt(var / C + 1e-6f));
+    const half4 m = half4(1.0h) + *(const device half4*)(scale + b * C + lid * 4);
+    const half4 p = y * m;
+    *(device half4*)(out + t * C + lid * 4) = p + *(const device half4*)(shift + b * C + lid * 4);
+""")
+
+
+def norm_mod(x, scale, shift):
+    """norm32(LayerNorm(eps 1e-6, no affine), x) * (1 + scale) + shift; x [B, L, 1024] FP16, scale, shift [B, 1, 1024]"""
+    B, L, C = x.shape
+    assert C == 1024 and x.dtype == scale.dtype == shift.dtype == F16
+    return _norm_mod_kernel(inputs=[x, scale, shift], grid=(B * L * 256, 1, 1), threadgroup=(256, 1, 1),
+                            output_shapes=[x.shape], output_dtypes=[F16])[0]
+
+
 def clamp_mul(x, f):
     f_t = mx.tanh(f)
     return x * f_t + x * (f - f_t)
@@ -416,8 +456,8 @@ class UnifiedTransformerBlock(nn.Module):
             return x + self.mlp(norm32(self.norm2, x))
         mod = (mod + self.shift_table.astype(mod.dtype))[:, None]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mx.split(mod, 6, axis=-1)
-        x = x + self.attn(norm32(self.norm1, x) * (1 + scale_msa) + shift_msa, rope, mask) * gate_msa
-        return x + self.mlp(norm32(self.norm2, x) * (1 + scale_mlp) + shift_mlp) * gate_mlp
+        x = x + self.attn(norm_mod(x, scale_msa, shift_msa), rope, mask) * gate_msa
+        return x + self.mlp(norm_mod(x, scale_mlp, shift_mlp)) * gate_mlp
 
 
 class LatentSeqMMFlowModel(nn.Module):
