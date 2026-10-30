@@ -1,8 +1,9 @@
 import json
 import os
+import time
 import types
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Union
 
 import numpy as np
@@ -30,6 +31,7 @@ class IdolOutput:
     gaussian: Gaussian               # the object; .save_ply(path) writes a standard 3DGS PLY
     preprocessed_image: Image.Image  # the 1024 x 1024 image the model saw (background removed, cropped)
     camera: dict                     # predicted input camera: yaw, pitch (radians), radius, fov (degrees)
+    timings: dict = field(default_factory=dict)  # seconds per stage: preprocess, encode, sample, decode
 
 
 def compile_for_sampling(denoiser):
@@ -48,10 +50,13 @@ def compile_for_sampling(denoiser):
 class IdolPipeline:
     """optimize (default on, CUDA only): ~1.7x faster sampling at the same output quality: compiled denoiser
     (torch.compile), conditional and unconditional passes batched together, cuDNN attention and TF32 matmuls while
-    sampling. The first generation in a process compiles first. optimize=False runs everything eagerly."""
+    sampling. The first generation in a process compiles first. optimize=False runs everything eagerly.
+
+    backend='mlx' (Apple Silicon): the denoiser runs in MLX (idol/mlx_dit.py); the rest stays in torch."""
     def __init__(self, weights_dir: str, device: Optional[str] = None, dinov3_dtype: str = 'bf16',
-                 optimize: bool = True):
-        self.device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
+                 optimize: bool = True, backend: str = 'torch'):
+        self.device = torch.device(device or ('cuda' if torch.cuda.is_available() else
+                                              'mps' if torch.backends.mps.is_available() else 'cpu'))
         with open(os.path.join(weights_dir, 'config.json')) as f:
             self.config = json.load(f)
         encoders = self.config['image_encoders']
@@ -61,15 +66,25 @@ class IdolPipeline:
             model.load_state_dict(load_file(os.path.join(weights_dir, f'{name}.safetensors')), strict=True)
             return model.eval().requires_grad_(False).to(self.device)
 
-        self.denoiser = load(LatentSeqMMFlowModel(**self.config['denoiser']['args']), 'denoiser')
+        self.backend = backend
+        if backend == 'mlx':
+            from . import mlx_dit
+            self.denoiser = mlx_dit.load_denoiser(os.path.join(weights_dir, 'denoiser.safetensors'),
+                                                  self.config['denoiser']['args'])
+        else:
+            self.denoiser = load(LatentSeqMMFlowModel(**self.config['denoiser']['args']), 'denoiser')
         self.decoder = load(OctreeProbabilityFixedlenDecoder(**self.config['decoder']['args']), 'decoder')
         self.decoder_gs = load(GaussianFixedlenDecoder(**self.config['decoder_gs']['args']), 'decoder_gs')
         self.background_remover = load(BiRefNet(), 'birefnet')
-        if self.device.type == 'cuda':
+        if self.device.type in ('cuda', 'mps'):
             self.background_remover.half()
+        if self.device.type == 'mps':  # complex RoPE is poorly supported on MPS; the real-valued path is the same math
+            for module in self.denoiser.modules():
+                if isinstance(module, RePo3DRotaryEmbedding):
+                    module.real_valued = True
         self.image_encoder = ImageEncoder(encoders['dinov3'], encoders['flux2_vae'], dinov3_dtype=dinov3_dtype,
                                           device=self.device)
-        self.optimize = optimize and self.device.type == 'cuda'
+        self.optimize = optimize and self.device.type == 'cuda' and backend == 'torch'
         if self.optimize:
             compile_for_sampling(self.denoiser)
 
@@ -111,21 +126,39 @@ class IdolPipeline:
 
         mode / crop_margin: see ``preprocess``.
         num_gaussians: 32,768 to 1,048,576, rounded down to a multiple of 32."""
+        stamps = [time.perf_counter()]
+
+        def stamp():
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize()
+            elif self.device.type == 'mps':
+                torch.mps.synchronize()
+            stamps.append(time.perf_counter())
+
         prepared = self.preprocess(image, mode=mode, crop_margin=crop_margin)
+        stamp()
         pixels = torch.from_numpy(np.array(prepared)).permute(2, 0, 1).float().div(255.0)[None].to(self.device)
 
         torch.manual_seed(seed)
         cond = self.image_encoder(pixels)
+        stamp()
         noise = TensorDict({
             'latent': torch.randn(1, self.denoiser.q_token_length, self.denoiser.in_channels, device=self.device),
             'camera': torch.randn(1, 1, self.denoiser.cam_channels, device=self.device),
         }, batch_size=1, device=self.device)
         with self._sampling_settings():
-            sample = sample_flow(self.denoiser, noise, cond=cond, neg_cond=cond.apply(torch.zeros_like),
+            sampler = sample_flow
+            if self.backend == 'mlx':
+                from .mlx_dit import sample_flow as sampler
+            sample = sampler(self.denoiser, noise, cond=cond, neg_cond=cond.apply(torch.zeros_like),
                                  steps=steps, rescale_t=rescale_t, cfg_strength=cfg_strength, verbose=verbose,
                                  batch_cfg=self.optimize)
+        stamp()
         gaussian = self.decode(sample['latent'], num_gaussians)
-        return IdolOutput(gaussian=gaussian, preprocessed_image=prepared, camera=decode_camera(sample['camera'][0, 0]))
+        stamp()
+        timings = dict(zip(['preprocess', 'encode', 'sample', 'decode'], np.diff(stamps).tolist()))
+        return IdolOutput(gaussian=gaussian, preprocessed_image=prepared, camera=decode_camera(sample['camera'][0, 0]),
+                          timings=timings)
 
     @contextmanager
     def _sampling_settings(self):

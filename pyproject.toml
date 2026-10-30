@@ -21,6 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 demo = ["gradio==5.49.1", "spaces"]
+mlx = ["mlx>=0.29"]
 
 [build-system]
 requires = ["hatchling"]
