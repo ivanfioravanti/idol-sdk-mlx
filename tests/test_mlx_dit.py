@@ -28,6 +28,21 @@ def test_rope_rmsnorm_kernel():
     assert rel(q_ref, q) < 1e-3 and rel(k_ref, k) < 1e-3, (rel(q_ref, q), rel(k_ref, k))   # FP16 output rounding
 
 
+def test_attention_kernel():
+    B, H, D = 2, 16, 64
+    for L, with_bias in ((300, False), (77, True), (2, False)):     # lengths off the 64-query / 32-key blocks
+        qkv = mx.random.normal((B, L, 3, H, D)).astype(mx.float16)
+        q, k = [(mx.random.normal((B, H, L, D)) * 2).astype(mx.float16) for _ in range(2)]
+        bias = mx.random.uniform(-3, 3, (L,)).astype(mx.float16) if with_bias else None
+        s = (q.astype(mx.float32) @ k.astype(mx.float32).transpose(0, 1, 3, 2)) * 0.125
+        if bias is not None:
+            s = s + bias.astype(mx.float32)
+        ref = (mx.softmax(s, axis=-1) @ qkv[:, :, 2].astype(mx.float32).transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
+        out = mlx_dit.attention(q, k, qkv, 0.125, bias).astype(mx.float32)
+        ref, out = torch.from_numpy(np.array(ref.reshape(B, L, H * D))), torch.from_numpy(np.array(out))
+        assert rel(ref, out) < 1e-3, (L, rel(ref, out))   # FP16 output rounding
+
+
 def test_linear_full_fp32():
     layer = mlx_dit.Linear(1024, 512)
     x = mx.random.normal((4096, 1024))
@@ -37,5 +52,6 @@ def test_linear_full_fp32():
 
 if __name__ == '__main__':
     test_rope_rmsnorm_kernel()
+    test_attention_kernel()
     test_linear_full_fp32()
     print('ok')

@@ -104,6 +104,147 @@ def rope_rmsnorm(qkv, ang, gamma_q, gamma_k):
                                 output_shapes=[(B, H, L, D)] * 2, output_dtypes=[F16] * 2)
 
 
+# Flash attention for head_dim 64, faster here than mx.fast.scaled_dot_product_attention (27.3 -> 26.1 ms at 12,294
+# tokens, 13.1 -> 12.2 ms at 8,195 with the key bias): MLX's kernel gives each simdgroup 8 query rows and reloads Q and K
+# fragments from threadgroup memory for every MMA; here a simdgroup keeps 16 query rows of Q in registers, so each K / V
+# fragment feeds two MMAs. FP16 operands, FP32 scores, softmax and accumulation, the same online softmax as MLX. Reads
+# V straight from the qkv projection and writes [B, L, H * 64], the layout the output projection takes.
+_ATTN_SOURCE = """
+    constexpr int D = 64, TD = 8, NSG = 4, TQ = 2, BQ = NSG * TQ * 8, BK = 32, TK = BK / 8, LD = D + 8;
+    threadgroup half Ks[BK * LD];      // K block [key][d], read transposed by simdgroup_load
+    threadgroup half Vs[BK * LD];      // V block [key][d]
+
+    const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+    const int qb = threadgroup_position_in_grid.x, h = threadgroup_position_in_grid.y, b = threadgroup_position_in_grid.z;
+    const int H = q_shape[1], L = q_shape[2], HD = H * D;
+    const short fm = (lane / 4 & 4) + (lane / 2) % 4, fn = (lane / 4 & 2) * 2 + (lane % 2) * 2;  // this lane's fragment row, cols
+
+    const device half* Q = q + (long)(b * H + h) * L * D;
+    const device half* K = k + (long)(b * H + h) * L * D;
+    const device half* V = qkv + (long)b * L * 3 * HD + 2 * HD + h * D;    // row stride 3 * HD
+    const float scale = scale_[0] * M_LOG2E_F;
+
+    simdgroup_half8x8 Qf[TQ][TD];
+    simdgroup_float8x8 Of[TQ][TD], Sf[TQ][TK];
+    float m[TQ], s[TQ];
+    const int row0 = qb * BQ + sg * TQ * 8;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < TQ; i++) {
+        const int r = metal::min(row0 + i * 8 + fm, L - 1);
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < TD; d++) {
+            const half2 x = *(const device half2*)(Q + (long)r * D + d * 8 + fn);
+            thread auto& e = Qf[i][d].thread_elements();
+            e[0] = x[0]; e[1] = x[1];
+            Of[i][d] = simdgroup_float8x8(0);
+        }
+        m[i] = -FLT_MAX; s[i] = 0;
+    }
+
+    constexpr int PER = BK * D / (NSG * 32);    // halfs of K and of V each thread moves per block
+    const int tid = sg * 32 + lane, lk = tid / (D / PER), ld0 = tid % (D / PER) * PER;
+    for (int kb = 0; kb < (L + BK - 1) / BK; kb++) {
+        const int key = kb * BK + lk;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < PER; j += 4) {
+            *(threadgroup half4*)(Ks + lk * LD + ld0 + j) = key < L ? *(const device half4*)(K + (long)key * D + ld0 + j) : half4(0);
+            *(threadgroup half4*)(Vs + lk * LD + ld0 + j) = key < L ? *(const device half4*)(V + (long)key * 3 * HD + ld0 + j) : half4(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < TQ; i++)
+            _Pragma("clang loop unroll(full)") for (int c = 0; c < TK; c++) Sf[i][c] = simdgroup_float8x8(0);
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < TD; d++) {
+            #pragma clang loop unroll(full)
+            for (int c = 0; c < TK; c++) {
+                simdgroup_half8x8 kf;
+                simdgroup_load(kf, Ks + c * 8 * LD + d * 8, LD, ulong2(0, 0), true);
+                _Pragma("clang loop unroll(full)") for (int i = 0; i < TQ; i++) simdgroup_multiply_accumulate(Sf[i][c], Qf[i][d], kf, Sf[i][c]);
+            }
+        }
+
+        const bool tail = (kb + 1) * BK > L;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < TQ; i++) {
+            float mx_ = m[i];
+            #pragma clang loop unroll(full)
+            for (int c = 0; c < TK; c++) {
+                thread auto& e = Sf[i][c].thread_elements();
+                const int col = kb * BK + c * 8 + fn;
+                e[0] *= scale; e[1] *= scale;
+                KEY_BIAS
+                if (tail) {
+                    if (col >= L) e[0] = -FLT_MAX;
+                    if (col + 1 >= L) e[1] = -FLT_MAX;
+                }
+                mx_ = metal::max(mx_, metal::max(e[0], e[1]));
+            }
+            mx_ = metal::max(mx_, simd_shuffle_xor(mx_, 1));      // the 4 lanes holding a fragment row
+            mx_ = metal::max(mx_, simd_shuffle_xor(mx_, 8));
+            float sum = 0;
+            #pragma clang loop unroll(full)
+            for (int c = 0; c < TK; c++) {
+                thread auto& e = Sf[i][c].thread_elements();
+                e[0] = fast::exp2(e[0] - mx_); e[1] = fast::exp2(e[1] - mx_);
+                sum += e[0] + e[1];
+            }
+            sum += simd_shuffle_xor(sum, 1);
+            sum += simd_shuffle_xor(sum, 8);
+            const float f = fast::exp2(m[i] - mx_);
+            m[i] = mx_;
+            s[i] = s[i] * f + sum;
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < TD; d++) {
+                thread auto& e = Of[i][d].thread_elements();
+                e[0] *= f; e[1] *= f;
+            }
+        }
+
+        #pragma clang loop unroll(full)
+        for (int c = 0; c < TK; c++) {
+            #pragma clang loop unroll(full)
+            for (int d = 0; d < TD; d++) {
+                simdgroup_half8x8 vf;
+                simdgroup_load(vf, Vs + c * 8 * LD + d * 8, LD);
+                _Pragma("clang loop unroll(full)") for (int i = 0; i < TQ; i++) simdgroup_multiply_accumulate(Of[i][d], Sf[i][c], vf, Of[i][d]);
+            }
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < TQ; i++) {
+        const int r = row0 + i * 8 + fm;
+        if (r >= L) continue;
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < TD; d++) {
+            thread auto& e = Of[i][d].thread_elements();
+            *(device half2*)(out + ((long)b * L + r) * HD + h * D + d * 8 + fn) = half2(half(e[0] / s[i]), half(e[1] / s[i]));
+        }
+    }
+"""
+_attn_kernels = {
+    with_bias: mx.fast.metal_kernel(
+        name=f'idol_attention{"_bias" if with_bias else ""}',
+        input_names=['q', 'k', 'qkv', 'scale_'] + (['key_bias'] if with_bias else []), output_names=['out'],
+        source=_ATTN_SOURCE.replace('KEY_BIAS', 'e[0] += M_LOG2E_F * float(key_bias[metal::min(col, L - 1)]);\n'
+                                                '                e[1] += M_LOG2E_F * float(key_bias[metal::min(col + 1, L - 1)]);'
+                                    if with_bias else ''))
+    for with_bias in (False, True)}
+
+
+def attention(q, k, qkv, scale, key_bias=None):
+    """q, k [B, H, L, 64] FP16, qkv [B, L, 3, H, 64] FP16 (v = qkv[:, :, 2]), key_bias [L] (added to the scores) or
+    None -> softmax(q k^T * scale + key_bias) v as [B, L, H * 64] FP16"""
+    B, H, L, D = q.shape
+    assert D == 64 and q.dtype == k.dtype == qkv.dtype == F16
+    inputs = [q, k, qkv, mx.array([scale], F32)] + ([key_bias] if key_bias is not None else [])
+    return _attn_kernels[key_bias is not None](inputs=inputs, grid=((L + 63) // 64 * 128, H, B), threadgroup=(128, 1, 1),
+                                               output_shapes=[(B, L, H * D)], output_dtypes=[F16])[0]
+
+
 def clamp_mul(x, f):
     f_t = mx.tanh(f)
     return x * f_t + x * (f - f_t)
@@ -180,9 +321,7 @@ class RopeMultiHeadAttention(nn.Module):
         B, L, C = x.shape
         qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
         q, k = rope_rmsnorm(qkv, rope, self.q_norm.gamma, self.k_norm.gamma)
-        v = qkv[:, :, 2].transpose(0, 2, 1, 3)
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.head_dim ** -0.5, mask=mask)
-        return self.out(out.transpose(0, 2, 1, 3).reshape(B, L, C))
+        return self.out(attention(q, k, qkv, self.head_dim ** -0.5, mask))
 
 
 class UnifiedTransformerBlock(nn.Module):
@@ -247,7 +386,7 @@ class LatentSeqMMFlowModel(nn.Module):
 
     def condition(self, cond):
         """cond: {'feature1' [B, L_c, 1280], 'feature2' [B, L_c, 128]} -> (image tokens after the context refiner,
-        attention mask or None). The context refiner has no time input, so sample_flow runs this once per request.
+        attention key bias [L] or None). The context refiner has no time input, so sample_flow runs this once per request.
 
         Identical image tokens (the all-zero unconditional input) stay identical through every block, since RoPE
         here comes from token features, not positions; and n copies of a key attend like one key with log(n) added to
@@ -263,8 +402,8 @@ class LatentSeqMMFlowModel(nn.Module):
             rest = n - math.exp(b1)
             b2 = np.float16(math.log(rest)) if rest > 0 else np.float16(-np.inf)
             h = h[:, :2]
-            mask = mx.zeros((1, 1, 1, self.q_token_length + 2 + 1), dtype=F16)    # [latent, 2 image tokens, camera]
-            mask[..., self.q_token_length:self.q_token_length + 2] = mx.array([float(b1), float(b2)], dtype=F16)
+            mask = mx.zeros((self.q_token_length + 2 + 1,), dtype=F16)    # key bias: [latent, 2 image tokens, camera]
+            mask[self.q_token_length:self.q_token_length + 2] = mx.array([float(b1), float(b2)], dtype=F16)
         for repo, block in zip(self.context_repo_layers, self.context_refiner):
             h = block(h, None, repo(h))
         return h, mask

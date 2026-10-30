@@ -26,8 +26,8 @@ for name, hc, mask in (('cond', cond[0], cond[1]), ('uncond', neg[0], neg[1])):
     B, L, C = h.shape
     qkv = blk.attn.qkv(h).reshape(B, L, 3, 16, 64); mx.eval(qkv)
     kern = lambda qkv, r: mlx_dit.rope_rmsnorm(qkv, r, blk.attn.q_norm.gamma, blk.attn.k_norm.gamma)
-    q, k = kern(qkv, r); v = qkv[:, :, 2].transpose(0, 2, 1, 3); mx.eval(q, k, v)
-    sd = lambda q, k, v: mx.fast.scaled_dot_product_attention(q, k, v, scale=0.125, mask=mask)
+    q, k = kern(qkv, r); mx.eval(q, k)
+    sd = lambda q, k, qkv: mlx_dit.attention(q, k, qkv, 0.125, mask)
     print(f'[{name} L={L}] repo {bench(rope, h):.2f} | block(no repo) {bench(fb, h, r):.2f} | attn {bench(attn, h, r):.2f} '
-          f'| qkv lin {bench(blk.attn.qkv, h):.2f} | rope_rms kern {bench(kern, qkv, r):.2f} | sdpa {bench(sd, q, k, v):.2f} '
+          f'| qkv lin {bench(blk.attn.qkv, h):.2f} | rope_rms kern {bench(kern, qkv, r):.2f} | attention {bench(sd, q, k, qkv):.2f} '
           f'| out lin {bench(blk.attn.out, h):.2f} | mlp {bench(mlp, h):.2f} ms')
