@@ -175,6 +175,14 @@ div.sl-section { font-weight: 700 !important; }
 #sl-status { font-size: 14px; min-height: 34px; }
 #sl-status [role="alert"] { color: #ed7652; overflow-wrap: anywhere; }
 #sl-status p, #sl-info p { margin: 4px 0; font-size: 13px; line-height: 1.4; }
+/* gr.Progress (the sampler's real steps) gets its own row under the status line: drawn over the status text it was
+   cramped and its step counter clipped. Hidden when idle. */
+#sl-progress:not(:has(.wrap:not(.hide))) { display: none; }
+#sl-progress:has(.wrap:not(.hide)) { min-height: 58px; }
+#sl-progress .wrap { background: transparent !important; }
+#sl-progress .progress-text { font-size: 13px; transform: none !important; }  /* gradio shifts it out of view */
+#sl-progress .progress-level-inner { font-size: 13px; }
+#sl-progress .progress-bar-wrap { width: 100% !important; height: 8px; }
 #sl-settings { margin-top: 0; }
 @media (max-width: 760px) {
   .sl-head { padding-top: 24px; }
@@ -250,6 +258,7 @@ with gr.Blocks(title=f"{NAME} · Speridlabs", theme=theme, css=CSS, js=THEME_JS,
             result = gr.Model3D(show_label=False, elem_id="result", height="clamp(260px, 48vh, 480px)",
                                 interactive=False, clear_color=(0.05, 0.05, 0.05, 1.0))
             status = gr.HTML("Ready · MLX denoiser, torch/MPS encoders and decoders.", elem_id="sl-status")
+            progress_row = gr.HTML("", elem_id="sl-progress")
             info = gr.HTML("", elem_id="sl-info")
             with gr.Accordion("Processed input matching the displayed splat", open=False):
                 prepared = gr.Image(type="filepath", interactive=False, show_label=False, height=180)
@@ -259,8 +268,9 @@ with gr.Blocks(title=f"{NAME} · Speridlabs", theme=theme, css=CSS, js=THEME_JS,
                          show_download_button=False, elem_id="presets")
     order = gr.State()
     inputs = [image, mode, steps, cfg_scale, rescale_t, seed, randomize, gaussians]
-    run_btn.click(run, inputs, [result, seed, info, status, prepared], show_progress="full", show_progress_on=[status],
-                  concurrency_limit=1, concurrency_id="idol-generation", api_name="generate")
+    run_btn.click(run, inputs, [result, seed, info, status, prepared], show_progress="full",
+                  show_progress_on=[progress_row], concurrency_limit=1, concurrency_id="idol-generation",
+                  api_name="generate")
     presets.select(pick, order, [image, mode, steps, cfg_scale, rescale_t, seed, randomize, gaussians])
     demo.load(shuffle_examples, None, [presets, order], show_progress="hidden")
     # loaded after the page script, so the viewer's .ply request already carries the cookies and gets the zoom
