@@ -45,8 +45,11 @@ def matmul32(x, w):
 
 
 class Linear(nn.Linear):
-    """nn.Linear, at full precision for FP32 inputs (matmul32). FP16 is exact in TF32 as is."""
+    """nn.Linear, at full precision for FP32 inputs (matmul32). FP16 is exact in TF32 as is. After LatentSeqMMFlowModel.to_f16()
+    the weight is held as weight_t [in, out], contiguous: MLX's GEMM is ~5% faster on it than on the weight.T view."""
     def __call__(self, x):
+        if 'weight_t' in self:
+            return mx.addmm(self.bias, x, self.weight_t) if 'bias' in self else x @ self.weight_t
         if x.dtype != F32:
             return super().__call__(x)
         y = matmul32(x, self.weight)
@@ -378,11 +381,13 @@ class LatentSeqMMFlowModel(nn.Module):
         self.cam_out_layer = Linear(model_channels, cam_channels)
 
     def to_f16(self):
-        """The torch model's convert_module_to_f16: the transformer blocks' Linear layers in FP16, the rest FP32."""
+        """The torch model's convert_module_to_f16: the transformer blocks' Linear layers in FP16, the rest FP32.
+        Their weights are then held transposed (Linear.weight_t)."""
         for block in self.blocks + self.noise_refiner + self.context_refiner:
             for _, module in block.named_modules():
                 if isinstance(module, nn.Linear):
                     module.set_dtype(F16)
+                    module.weight_t = mx.contiguous(module.pop('weight').T)
 
     def condition(self, cond):
         """cond: {'feature1' [B, L_c, 1280], 'feature2' [B, L_c, 128]} -> (image tokens after the context refiner,

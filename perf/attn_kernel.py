@@ -186,7 +186,7 @@ def bench(f, *a, n=10):
 if __name__ == '__main__':
     import sys
     H, D = 16, 64
-    configs = [(2, 32, 4, 1), (2, 64, 4, 1)]
+    configs = [(2, 32, 4, 1), (3, 32, 4, 1), (3, 32, 2, 1), (2, 32, 8, 1)]
     for L, with_bias in ((12294, False), (8195, True)):
         qkv = (mx.random.normal((1, L, 3, H, D)) * 0.5).astype(mx.float16)
         q = mx.random.normal((1, H, L, D)).astype(mx.float16) * 2
@@ -209,7 +209,7 @@ if __name__ == '__main__':
         fl = 4 * L * L * D * H
         t = bench(ref_f, q, k, v)
         print(f'L={L} mlx sdpa {t:.2f} ms {fl / t / 1e9:.1f} TFLOPS rel {rel(ref):.3e}', flush=True)
-        for FOLD, TAU, tq, bk, nsg, nbuf in [(fo, ta) + c for c in configs for fo, ta in ((False, 0.0), (True, 0.0), (False, 8.0), (True, 8.0))]:
+        for FOLD, TAU, tq, bk, nsg, nbuf in [(fo, ta) + c for c in configs for fo, ta in ((False, 0.0),)]:
             f = lambda q, k, qkv: attention(q, k, qkv, 0.125, bias, tq, bk, nsg, nbuf)
             o = f(q, k, qkv); mx.eval(o)
             t = bench(f, q, k, qkv)
