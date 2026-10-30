@@ -1,16 +1,12 @@
+import html
 import json
+import os
 import random
+import time
+import traceback
 from pathlib import Path
 
 import gradio as gr
-
-try:
-    import spaces  # Hugging Face ZeroGPU; imported before the model so its CUDA placement is deferred
-
-    gpu = spaces.GPU(duration=120)
-except ImportError:
-    def gpu(fn):
-        return fn
 
 import model  # noqa: E402
 
@@ -18,46 +14,76 @@ import model  # noqa: E402
 VIEWER_ZOOM = 5.5 / 3
 
 
-NAME = "Idol"
+NAME = "Idol - MLX"
 TAGLINE = "<strong>One image in, a 3D object out.</strong> Idol turns a single picture of an object into " \
           "3D Gaussians splat. Pick an example below, or <em>upload your own.</em>"
-LINKS = {"Code": "https://github.com/speridlabs/idol-sdk",
+LINKS = {"Code · Speridlabs": "https://github.com/speridlabs/idol-sdk",
+         "Original Space": "https://huggingface.co/spaces/speridlabs/idol",
          "Weights": "https://huggingface.co/speridlabs/idol"}
 
 ROOT = Path(__file__).parent
 PRESETS = json.loads((ROOT / "examples/presets.json").read_text())
 MODE_LABEL = {mode: label for label, mode in model.MODES.items()}
-# the example shown when the page opens, with its splat and model input generated beforehand with its own settings
-DEFAULT_EXAMPLE = next(p for p in PRESETS if p["image"] == "examples/obj-backpack.webp")
-DEFAULT_PLY = ROOT / "examples/default-obj-backpack.ply"
+# The archived avocado is a real prior local generation, not the output of today's settings.
+DEFAULT_EXAMPLE = dict(next(p for p in PRESETS if p["image"] == "examples/food-avocado.webp"), seed=42)
+ARCHIVE = Path(os.environ.get("IDOL_PRELOAD_DIR", Path.home() / "github/idol-sdk-mlx/outputs-mlx"))
+DEFAULT_PLY = ARCHIVE / "food-avocado.ply"
+DEFAULT_INPUT = ARCHIVE / "food-avocado_input.png"
 GAUSSIAN_LABEL = {count: label for label, count in model.GAUSSIANS.items()}
 
 
-@gpu
-def infer(image, mode, steps, cfg_scale, rescale_t, seed, randomize, gaussians):
+
+
+def meta(saved):
+    timings = " · ".join(
+        f"{html.escape(stage)} {seconds:.2f} s" for stage, seconds in saved["timings"].items()
+    ) or "Pipeline did not provide stage timings"
+    load = (f' · first model load {saved["load_seconds"]:.2f} s'
+            if saved["load_seconds"] is not None else " · model already loaded")
+    return (f'<div class="sl-meta">Generated locally · MLX denoiser + torch/MPS · '
+            f'{saved["num_gaussians"]:,} Gaussians · {saved["steps"]} steps · seed {saved["seed"]}</div>'
+            f'<p>{timings}<br>Total wall time {saved["wall_seconds"]:.2f} s{load} '
+            '(wall time includes loading when needed and file export).</p>')
+
+
+def run(image, mode, steps, cfg_scale, rescale_t, seed, randomize, gaussians,
+        progress=gr.Progress(track_tqdm=True)):   # the sampler's real tqdm steps, shown on the status line
     if image is None:
-        raise gr.Error("Upload an image or pick an example first.")
-    if randomize:
-        seed = random.randint(0, 2**31 - 1)
-    ply, prepared = model.generate(image, model.MODES[mode], int(steps), cfg_scale, rescale_t, int(seed),
-                                   model.GAUSSIANS[gaussians])
-    return ply, prepared, seed
-
-
-def meta(gaussians, steps):
-    return f'<div class="sl-meta"><span>{gaussians} Gaussians · {int(steps)} steps</span></div>'
-
-
-def run(image, mode, steps, cfg_scale, rescale_t, seed, randomize, gaussians):
-    ply, _, seed = infer(image, mode, steps, cfg_scale, rescale_t, seed, randomize, gaussians)
-    return ply, seed, meta(gaussians, steps)
+        yield gr.skip(), gr.skip(), gr.skip(), "Error: upload an image or pick an example first.", gr.skip()
+        return
+    seed = random.randint(0, 2**31 - 1) if randomize else int(seed)
+    started = time.time()
+    yield (gr.skip(), seed, gr.skip(),
+           f'<p class="idol-clock" data-started="{started}">Generating locally · elapsed '
+           '<span>0.0 s</span> · previous result retained. First run also loads the cached models.</p>',
+           gr.skip())
+    try:
+        saved = model.generate(image, model.MODES[mode], int(steps), cfg_scale, rescale_t, seed,
+                               model.GAUSSIANS[gaussians])
+    except Exception as exc:
+        traceback.print_exc()
+        message = html.escape(f"{type(exc).__name__}: {exc}")
+        yield (gr.skip(), seed, gr.skip(),
+               f'<p role="alert"><strong>Generation failed after {time.time() - started:.1f} s.</strong> '
+               f'Previous result retained. {message}</p>', gr.skip())
+        return
+    yield saved["ply"], seed, meta(saved), "Generation complete. Drag the splat to orbit; scroll to zoom.", saved["prepared"]
 
 
 def show_default_example():
-    if not DEFAULT_PLY.exists():  # the .ply ships with the Space only; without it the viewer starts empty
-        return None, ""
-    p = DEFAULT_EXAMPLE
-    return str(DEFAULT_PLY), meta(GAUSSIAN_LABEL[p["num_gaussians"]], p["steps"])
+    saved = model.previous()
+    if saved:
+        return saved["ply"], meta(saved), saved["prepared"], "Restored the last successful local result.", saved["input"]
+    if not DEFAULT_PLY.is_file() or not DEFAULT_INPUT.is_file():
+        return (gr.skip(), "", gr.skip(),
+                f"Preload missing: {DEFAULT_PLY} and {DEFAULT_INPUT}. Start a generation or set IDOL_PRELOAD_DIR.",
+                gr.skip())
+    return (str(DEFAULT_PLY),
+            '<div class="sl-meta">Previously generated local avocado · archived .ply</div>'
+            '<p>Matching processed input below. Original run settings and timings were not recorded; '
+            'the controls are settings for the next generation, not provenance for this archive.</p>',
+            str(DEFAULT_INPUT), "Ready · orbit the existing splat or generate a new one.",
+            str(ROOT / DEFAULT_EXAMPLE["image"]))
 
 
 def shuffle_examples():
@@ -96,17 +122,17 @@ CSS = """
 :root { --sl-fg: #000; --sl-fg-2: #444; --sl-fg-3: #6b6b6b; --sl-rule: #e3e3e3; }
 .dark { --sl-fg: #fff; --sl-fg-2: rgba(255,255,255,.75); --sl-fg-3: rgba(255,255,255,.55);
   --sl-rule: rgba(255,255,255,.15); }
-.gradio-container { max-width: 1280px !important; margin: 0 auto !important; padding: 0 32px !important; }
+.gradio-container { max-width: 1280px !important; margin: 0 auto !important; padding: 0 20px !important; }
 footer { display: none !important; }
-.sl-head { padding: 40px 0 28px; border-bottom: 1px solid var(--sl-rule); margin-bottom: 8px; }
+.sl-head { padding: 14px 0 12px; border-bottom: 1px solid var(--sl-rule); margin-bottom: 8px; }
 .sl-label, .sl-meta, .sl-links a, .sl-links button, .sl-section, .block-label, .label-wrap span, label > span {
   font-family: 'IBM Plex Mono', ui-monospace, monospace !important; text-transform: uppercase;
   letter-spacing: .12em; font-size: 13px !important; font-weight: 600 !important; color: var(--sl-fg-3) !important; }
 .gradio-container { font-weight: 500; }
-.sl-head h1 { margin: 14px 0 0; font-size: clamp(56px, 6.4vw, 104px); font-weight: 700; line-height: .86;
+.sl-head h1 { margin: 0; font-size: 40px; font-weight: 700; line-height: 1;
   letter-spacing: -0.055em; color: var(--sl-fg); }
 .sl-row { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px 40px; }
-.sl-head p { margin: 18px 0 0; max-width: 60ch; font-size: 19px; font-weight: 500; line-height: 1.5; color: var(--sl-fg-2); }
+.sl-head p { margin: 8px 0 0; max-width: 80ch; font-size: 15px; font-weight: 500; line-height: 1.4; color: var(--sl-fg-2); }
 .sl-head p strong { color: var(--sl-fg); font-weight: 600; }
 .sl-head p em { color: #d94a1f; font-style: normal; font-weight: 600; }
 .sl-links { display: flex; gap: 10px; }
@@ -117,7 +143,7 @@ footer { display: none !important; }
 #sl-theme { width: 44px; padding: 0; justify-content: center; font-size: 19px !important; letter-spacing: 0; }
 #sl-theme::before { content: "☾"; }
 .dark #sl-theme::before { content: "☀"; }
-.sl-meta { display: flex; gap: 16px; white-space: nowrap; padding-top: 6px; font-size: 12px !important;
+.sl-meta { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 6px; font-size: 12px !important;
   font-weight: 400 !important; color: var(--sl-fg-2) !important; }
 div.sl-section { font-weight: 700 !important; }
 .sl-section { border-top: 1px solid var(--sl-rule); padding-top: 28px !important; margin-top: 28px; }
@@ -131,9 +157,9 @@ div.sl-section { font-weight: 700 !important; }
 #presets .grid-wrap { max-height: none !important; height: auto !important; overflow: visible !important; }
 #sl-settings > .label-wrap span { color: var(--sl-fg) !important; font-weight: 600; }
 #presets .thumbnail-item.selected { outline: 2px solid #d94a1f; outline-offset: -2px; }
-/* only the input image stretches, so the input column ends where the viewer ends; the viewer keeps its height */
+/* Keep the input compact and the splat viewer visible above the example gallery. */
 #sl-main > .column > *, #sl-main > .column > .form > * { flex-grow: 0 !important; }
-#sl-main > .column:first-child > #sl-input { flex: 1 1 0 !important; height: auto !important; min-height: 360px; }
+#sl-main > .column:first-child > #sl-input { flex: 0 0 auto !important; min-height: 180px; }
 #sl-input .image-container, #sl-input .upload-container { min-height: 0; }
 /* icons: larger and drawn with a thicker stroke */
 .icon-button > div.small, .icon-button > div.x-small { width: 20px; height: 20px; }
@@ -146,6 +172,10 @@ div.sl-section { font-weight: 700 !important; }
 #sl-settings .slider_input_container .min_value { text-align: left; }
 #sl-settings .slider_input_container .max_value { text-align: right; }
 #sl-settings .tab-like-container input[type="number"] { width: 64px; flex: 0 0 64px; }
+#sl-status { font-size: 14px; min-height: 34px; }
+#sl-status [role="alert"] { color: #ed7652; overflow-wrap: anywhere; }
+#sl-status p, #sl-info p { margin: 4px 0; font-size: 13px; line-height: 1.4; }
+#sl-settings { margin-top: 0; }
 @media (max-width: 760px) {
   .sl-head { padding-top: 24px; }
   #presets .grid-container { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; }
@@ -174,6 +204,11 @@ THEME_JS = """() => {
   };
   const set = (dark) => { document.body.classList.toggle('dark', dark); localStorage.setItem('sl-theme', dark ? 'dark' : 'light'); };
   set(localStorage.getItem('sl-theme') !== 'light');
+  window.setInterval(() => {
+    document.querySelectorAll('.idol-clock[data-started]').forEach(clock => {
+      clock.querySelector('span').textContent = Math.max(0, Date.now() / 1000 - Number(clock.dataset.started)).toFixed(1) + ' s';
+    });
+  }, 250);
   document.addEventListener('click', (e) => { if (e.target.closest('#sl-theme')) set(!document.body.classList.contains('dark')); });
 }""".replace("VIEWER_ZOOM_VALUE", f"{VIEWER_ZOOM:.6f}")
 # Page padding on phones. It lives in <head> because gradio scopes every rule inside the custom CSS under the page
@@ -185,7 +220,7 @@ PHONE_HEAD = """<style>@media (max-width: 760px) {
 LINK_HTML = "".join(f'<a href="{u}" target="_blank">{t}</a>' for t, u in LINKS.items())
 HEAD = f"""
 <div class="sl-head">
-  <span class="sl-label">Speridlabs · Research</span>
+  <span class="sl-label">Speridlabs · local Apple Silicon demo · MLX + torch/MPS</span>
   <div class="sl-row">
     <h1>{NAME}</h1>
     <div class="sl-links">{LINK_HTML}<button id="sl-theme" type="button" aria-label="Toggle light/dark"></button></div>
@@ -200,7 +235,7 @@ with gr.Blocks(title=f"{NAME} · Speridlabs", theme=theme, css=CSS, js=THEME_JS,
     with gr.Row(equal_height=True, elem_id="sl-main"):
         with gr.Column(scale=5):
             image = gr.Image(value=str(ROOT / first["image"]), type="pil", image_mode="RGBA", label="Input image",
-                             sources=["upload", "clipboard"], height=360, elem_id="sl-input")
+                             sources=["upload", "clipboard"], height=220, elem_id="sl-input")
             mode = gr.Radio(list(model.MODES), value=MODE_LABEL[first["mode"]], label="Input type")
             run_btn = gr.Button("Generate", variant="primary", elem_id="generate")
             with gr.Accordion("Settings", open=False, elem_id="sl-settings"):
@@ -212,23 +247,26 @@ with gr.Blocks(title=f"{NAME} · Speridlabs", theme=theme, css=CSS, js=THEME_JS,
                 seed = gr.Number(value=first["seed"], precision=0, label="Seed")
                 randomize = gr.Checkbox(value=False, label="Random seed")
         with gr.Column(scale=7):
-            result = gr.Model3D(show_label=False, elem_id="result", height="min(640px, 92vw)",
-                                clear_color=(0.05, 0.05, 0.05, 1.0))
-    with gr.Row():
-        gr.Column(scale=5, min_width=0, elem_id="sl-meta-spacer")
-        with gr.Column(scale=7):
-            info = gr.HTML("")
+            result = gr.Model3D(show_label=False, elem_id="result", height="clamp(260px, 48vh, 480px)",
+                                interactive=False, clear_color=(0.05, 0.05, 0.05, 1.0))
+            status = gr.HTML("Ready · MLX denoiser, torch/MPS encoders and decoders.", elem_id="sl-status")
+            info = gr.HTML("", elem_id="sl-info")
+            with gr.Accordion("Processed input matching the displayed splat", open=False):
+                prepared = gr.Image(type="filepath", interactive=False, show_label=False, height=180)
     gr.HTML('<div class="sl-section">Examples — click to load the image and its settings</div>')
     presets = gr.Gallery(None, columns=6, rows=4, height="auto",
                          object_fit="contain", allow_preview=False, show_label=False, show_share_button=False,
                          show_download_button=False, elem_id="presets")
     order = gr.State()
     inputs = [image, mode, steps, cfg_scale, rescale_t, seed, randomize, gaussians]
-    run_btn.click(run, inputs, [result, seed, info], show_progress_on=result)
+    run_btn.click(run, inputs, [result, seed, info, status, prepared], show_progress="full", show_progress_on=[status],
+                  concurrency_limit=1, concurrency_id="idol-generation", api_name="generate")
     presets.select(pick, order, [image, mode, steps, cfg_scale, rescale_t, seed, randomize, gaussians])
     demo.load(shuffle_examples, None, [presets, order], show_progress="hidden")
     # loaded after the page script, so the viewer's .ply request already carries the cookies and gets the zoom
-    demo.load(show_default_example, None, [result, info], show_progress="hidden")
+    demo.load(show_default_example, None, [result, info, prepared, status, image], show_progress="hidden")
 
 if __name__ == "__main__":
-    demo.queue().launch()
+    demo.queue().launch(server_name="127.0.0.1", server_port=int(os.environ.get("IDOL_PORT", "7862")),
+                        allowed_paths=[str(model.OUTPUT_DIR), str(ARCHIVE), str(ROOT / "examples")],
+                        show_error=True)

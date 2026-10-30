@@ -28,6 +28,8 @@ def main():
     parser.add_argument('--no_optimize', dest='optimize', action='store_false',
                         help='turn off the faster sampling (torch.compile, batched guidance, cuDNN attention, TF32) '
                              'that is on by default on GPU')
+    parser.add_argument('--backend', choices=['torch', 'mlx'], default='torch',
+                        help="'mlx': run the denoiser in MLX (Apple Silicon)")
     args = parser.parse_args()
 
     if os.path.isdir(args.image):
@@ -38,7 +40,8 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     try:
-        pipeline = IdolPipeline.from_pretrained(args.weights, dinov3_dtype=args.dinov3_dtype, optimize=args.optimize)
+        pipeline = IdolPipeline.from_pretrained(args.weights, dinov3_dtype=args.dinov3_dtype, optimize=args.optimize,
+                                                backend=args.backend)
     except EncoderAccessError as error:
         raise SystemExit(f'error: {error}')
     for path in images:
@@ -50,7 +53,8 @@ def main():
         output.preprocessed_image.save(os.path.join(args.out, f'{name}_input.png'))
         with open(os.path.join(args.out, f'{name}_camera.json'), 'w') as f:
             json.dump(output.camera, f, indent=2)
-        print(f'{name}: {args.out}/{name}.ply')
+        times = ', '.join(f'{stage} {seconds:.1f}s' for stage, seconds in output.timings.items())
+        print(f'{name}: {args.out}/{name}.ply ({sum(output.timings.values()):.1f}s: {times})')
 
 
 if __name__ == '__main__':

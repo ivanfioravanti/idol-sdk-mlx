@@ -74,6 +74,9 @@ Other flags:
 | `--dinov3_dtype` | bf16 | `fp32` runs the DINOv3 encoder in full precision (1.7 GB more memory) |
 | `--weights` | `speridlabs/idol` | a Hugging Face repo or a local folder |
 | `--no_optimize` | optimized | turn off the faster sampling (see below) |
+| `--backend` | `torch` | `mlx` runs the denoiser in MLX on Apple Silicon (see [Apple Silicon](#apple-silicon-mps-and-mlx)) |
+
+**Apple Silicon:** runs on MPS automatically; `--backend mlx` is faster. See [Apple Silicon](#apple-silicon-mps-and-mlx).
 
 **Faster sampling is on by default on GPU** The first image in a process is slower while it pytorch compiles; the rest run at full
 speed. 
@@ -91,13 +94,110 @@ output.preprocessed_image.save("photo_input.png")
 
 ### Demo
 
-The Gradio app behind the [Hugging Face Space](https://huggingface.co/spaces/speridlabs/idol) is in `demo/`,
-with the example images. It runs on ZeroGPU there and on any local GPU:
+The Gradio app behind the [Hugging Face Space](https://huggingface.co/spaces/speridlabs/idol) is in `demo/`, with
+the example images. In this fork it is adapted to run locally on Apple Silicon with the MLX backend: see
+[the Gradio demo on Apple Silicon](#gradio-demo-on-apple-silicon).
+
+## Apple Silicon (MPS and MLX)
+
+On a Mac the pipeline runs on the GPU through PyTorch MPS, picked automatically. With the MLX backend the denoiser,
+the 50-step loop that takes ~95% of a request, runs in [MLX](https://github.com/ml-explore/mlx) instead
+(`idol/mlx_dit.py`). Background removal, DINOv3, the FLUX.2 VAE and the two decoders stay on MPS: they run once per
+image, about 2 s together.
 
 ```bash
-pip install -e ".[demo]"
-cd demo && python app.py
+pip install -e ".[mlx]"
+python -m idol.sample --image photo.jpg --backend mlx
 ```
+
+```python
+pipeline = IdolPipeline.from_pretrained("speridlabs/idol", backend="mlx")
+output = pipeline("photo.jpg")
+print(output.timings)   # seconds per stage: preprocess, encode, sample, decode (every backend)
+```
+
+The MLX denoiser loads the same `denoiser.safetensors`, no conversion step. Same seed, same noise: the two backends
+generate the same object (see [Accuracy](#accuracy)).
+
+### Speed
+
+One image to 262,144 Gaussians at 50 steps on an M5 Max (128 GB), median of 3 runs with the backends alternating:
+
+| Image | PyTorch MPS | MLX | Speedup |
+|---|---|---|---|
+| `food-avocado.webp` | 169.4 s | 102.8 s | 1.65x |
+| `fig-fox.webp` | 171.5 s | 89.4 s | 1.92x |
+
+Other work was using the GPU during these runs, so the absolute times are slower than on an idle Mac; the backends
+alternated run by run, so the speedup is the number to compare. They predate the last two optimizations below (the
+shared latent stream and the merged RePo matmul). Measure your machine:
+
+```bash
+python -m idol.bench --image demo/examples/food-avocado.webp demo/examples/fig-fox.webp --runs 3
+```
+
+It warms each backend up, alternates them run by run, appends every run (commit, chip, stage timings, camera) to
+`benchmarks.jsonl` and prints medians with how far MLX's predicted camera is from PyTorch's. Nothing else should use the
+GPU meanwhile: a second job slows both backends 2-4x.
+
+### What the MLX port does
+
+Profiled per component. Each change below was checked against the PyTorch FP32 reference before it was kept.
+
+| Change | Why | Effect |
+|---|---|---|
+| Same module tree and parameter names as `models/dit.py`; FP16 transformer blocks, FP32 elsewhere | loads the PyTorch checkpoint as is, same precision layout as the original | |
+| Full-precision FP32 matmuls ("3xTF32") | MLX's GPU matmul rounds FP32 operands to TF32 (~8e-4 relative error), which the FP32 RoPE angle layers amplify. Each operand is split into a TF32-exact part and its remainder, and three products are summed | 50-step agreement with FP32: cos 0.968 → 0.995; costs ~3% |
+| Fixed position embedding computed by the PyTorch module at load | its frequencies reach 2^16: sin() of FP32 arguments up to ~4e5 turns 1-ulp differences into errors of 0.03 | exact |
+| Fused RoPE + RMSNorm Metal kernel | rotating and normalising q and k as separate MLX ops took 7.6 ms of a 24 ms block (profiled alone) for memory-bound work | 0.43 ms per block |
+| Image tokens computed once per request | the context refiner has no time input, so its output is the same at all 50 steps | skips 2 blocks per pass |
+| Unconditional pass on 8,195 tokens instead of 12,294 | its image input is all zeros, so the 4,101 image tokens stay identical through every block (RoPE here comes from token features, not positions), and n identical keys attend like one key with log(n) added to its score. Kept as two tokens whose FP16 biases sum to n, as one FP16 bias would be off by 0.4% | unconditional pass 519 → 304 ms |
+| Latent stream shared by both guidance passes | the noise refiner, time and camera embeddings do not see the condition | skips 2 blocks per step |
+| One precise matmul for each RePo layer's gate and content projections | halves the operand splits and matmul launches | |
+| `mx.compile` per pass, next step queued while the GPU runs the current one | | |
+
+Tried and dropped: running both guidance passes as one batch-2 forward (no faster in PyTorch MPS, slower in MLX:
+1.40 s against 2 x 0.61 s); bfloat16 kernels (attention as fast as float16, matmuls ~12% slower).
+
+The PyTorch path needed three changes to run on MPS: picking `mps` as the device, BiRefNet in FP16, and the denoiser's
+real-valued RoPE (complex tensors are poorly supported on MPS; the math is the same).
+
+### Accuracy
+
+| Check | PyTorch MPS (FP16) | MLX |
+|---|---|---|
+| One forward pass, relative error vs PyTorch FP32 (latent / camera) | 3.43e-3 / 4.12e-3 | 3.53e-3 / 4.37e-3 |
+| 50 sampling steps, cosine similarity to PyTorch FP32 (latent) | 0.9959 | 0.9922 |
+| Real images, input camera vs PyTorch MPS (yaw / pitch) | | avocado 0.10° / 0.04°, fox 0.04° / 0.02° |
+
+The first two rows use random tokens in place of the image encoders. All 50-step FP16 runs differ from FP32 by a
+comparable amount: rounding compounds over the steps in PyTorch's own FP16 path too. `python tests/test_mlx_dit.py`
+checks the Metal kernel and the FP32 matmul against PyTorch.
+
+Known MLX limitations (0.32.4 and `main` at `1ba7f969`) worked around here: two guidance passes in one compiled graph
+fail with `unordered_map::at: key not found`, so each pass compiles separately; attention masks must match the query
+dtype (FP16), hence the two-token log-count bias above.
+
+### Gradio demo on Apple Silicon
+
+```bash
+pip install -e ".[mlx,demo]"
+cd demo && python app.py          # http://127.0.0.1:7862
+```
+
+The model loads on the first Generate (MLX denoiser, everything else on MPS) and stays loaded; requests run one at a
+time. Every result (`.ply`, input images, the settings and the real stage timings) is saved to `outputs-demo/`, and the
+latest one is shown again after a restart. Settings:
+
+| Variable | Default | |
+|---|---|---|
+| `IDOL_PORT` | `7862` | port, on 127.0.0.1 |
+| `IDOL_WEIGHTS` | `speridlabs/idol` | a Hugging Face repo or a local folder |
+| `IDOL_OUTPUT_DIR` | `outputs-demo/` | where results go |
+| `IDOL_PRELOAD_DIR` | `~/github/idol-sdk-mlx/outputs-mlx` | a folder with `food-avocado.ply` and `food-avocado_input.png` to show before the first Generate |
+
+Once the weights are cached, `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1` runs it without network access. Setup
+details and a walkthrough are in [`demo/README.md`](demo/README.md).
 
 ## More details about the model
 
