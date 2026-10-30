@@ -21,9 +21,24 @@ def tf32_split(a):
     return hi, a - hi
 
 
+def _fp32_matmul_is_exact():
+    """Whether this GPU's FP32 matmul keeps full FP32 precision. On M5 (Neural Accelerators) MLX rounds FP32 operands
+    to TF32 (~1e-3 relative error); M1-M4 multiply in full FP32 (~5e-7), where 3xTF32 only triples the cost."""
+    rng = np.random.default_rng(0)
+    x, w = rng.standard_normal((256, 1024), np.float32), rng.standard_normal((256, 1024), np.float32)
+    ref = x.astype(np.float64) @ w.astype(np.float64).T
+    y = np.array(mx.array(x) @ mx.array(w).T, np.float64)
+    return float(np.linalg.norm(y - ref) / np.linalg.norm(ref)) < 1e-5
+
+
+FP32_MATMUL_EXACT = _fp32_matmul_is_exact()
+
+
 def matmul32(x, w):
-    """x @ w.T at full FP32 precision: MLX's GPU matmul rounds FP32 operands to TF32 (~1e-3 relative error, amplified
-    by the RoPE angles), so this runs three TF32-exact products ("3xTF32")."""
+    """x @ w.T at full FP32 precision: where MLX's GPU matmul rounds FP32 operands to TF32 (~1e-3 relative error,
+    amplified by the RoPE angles), this runs three TF32-exact products ("3xTF32"); elsewhere one plain product."""
+    if FP32_MATMUL_EXACT:
+        return x @ w.T
     x_hi, x_lo = tf32_split(x)
     w_hi, w_lo = tf32_split(w.T)
     return x_hi @ w_hi + (x_hi @ w_lo + x_lo @ w_hi)
