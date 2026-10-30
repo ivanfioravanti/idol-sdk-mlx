@@ -148,6 +148,7 @@ Profiled per component. Each change below was checked against the PyTorch FP32 r
 |---|---|---|
 | Same module tree and parameter names as `models/dit.py`; FP16 transformer blocks, FP32 elsewhere | loads the PyTorch checkpoint as is, same precision layout as the original | |
 | Full-precision FP32 matmuls ("3xTF32") | MLX's GPU matmul rounds FP32 operands to TF32 (~8e-4 relative error), which the FP32 RoPE angle layers amplify. Each operand is split into a TF32-exact part and its remainder, and three products are summed | 50-step agreement with FP32: cos 0.968 → 0.995; costs ~3% |
+| 3xTF32 only where needed | M1–M4 GPUs multiply FP32 in full precision (5e-7 relative error); only M5 rounds to TF32. A probe at import picks plain FP32 matmuls when they are exact | M3 Ultra: RePo layer 2.1 → 1.2 ms per block, sampling −4.5%, same error |
 | Fixed position embedding computed by the PyTorch module at load | its frequencies reach 2^16: sin() of FP32 arguments up to ~4e5 turns 1-ulp differences into errors of 0.03 | exact |
 | Fused RoPE + RMSNorm Metal kernel | rotating and normalising q and k as separate MLX ops took 7.6 ms of a 24 ms block (profiled alone) for memory-bound work | 0.43 ms per block |
 | Image tokens computed once per request | the context refiner has no time input, so its output is the same at all 50 steps | skips 2 blocks per pass |
