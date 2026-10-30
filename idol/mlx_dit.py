@@ -35,24 +35,25 @@ FP32_MATMUL_EXACT = _fp32_matmul_is_exact()
 
 
 def matmul32(x, w):
-    """x @ w.T at full FP32 precision: where MLX's GPU matmul rounds FP32 operands to TF32 (~1e-3 relative error,
+    """x @ w at full FP32 precision: where MLX's GPU matmul rounds FP32 operands to TF32 (~1e-3 relative error,
     amplified by the RoPE angles), this runs three TF32-exact products ("3xTF32"); elsewhere one plain product."""
     if FP32_MATMUL_EXACT:
-        return x @ w.T
+        return x @ w
     x_hi, x_lo = tf32_split(x)
-    w_hi, w_lo = tf32_split(w.T)
+    w_hi, w_lo = tf32_split(w)
     return x_hi @ w_hi + (x_hi @ w_lo + x_lo @ w_hi)
 
 
 class Linear(nn.Linear):
-    """nn.Linear, at full precision for FP32 inputs (matmul32). FP16 is exact in TF32 as is. After LatentSeqMMFlowModel.to_f16()
-    the weight is held as weight_t [in, out], contiguous: MLX's GEMM is ~5% faster on it than on the weight.T view."""
+    """nn.Linear, at full precision for FP32 inputs (matmul32). FP16 is exact in TF32 as is. After
+    LatentSeqMMFlowModel.to_f16() the weight is held as weight_t [in, out], contiguous: MLX's GEMM is ~5% faster on it
+    than on the weight.T view."""
     def __call__(self, x):
         if 'weight_t' in self:
             return mx.addmm(self.bias, x, self.weight_t) if 'bias' in self else x @ self.weight_t
         if x.dtype != F32:
             return super().__call__(x)
-        y = matmul32(x, self.weight)
+        y = matmul32(x, self.weight.T)
         return y + self.bias if 'bias' in self else y
 
 
@@ -248,6 +249,61 @@ def attention(q, k, qkv, scale, key_bias=None):
                                                output_shapes=[(B, L, H * D)], output_dtypes=[F16])[0]
 
 
+# The two ends of a RePo layer, fused. LayerNorm of FP16 tokens in FP32 in one pass (one threadgroup per token, 4
+# channels per thread), replacing a cast and mx.fast.layer_norm. Then, from the gate / content projections:
+# silu(gate) * content -> final_map (128 -> 3 per head, FP32 FMAs) -> clamp_mul angles, written as [N, H, 32];
+# replaces an FP32 matmul with 48 outputs and the elementwise ops around it. Same FP32 math (angles agree to ~2e-7).
+_repo_norm_kernel = mx.fast.metal_kernel(
+    name='idol_repo_norm',
+    input_names=['x', 'w', 'b'],
+    output_names=['out'],
+    source="""
+    const uint t = threadgroup_position_in_grid.x, lid = thread_position_in_threadgroup.x;
+    const uint C = x_shape[2], sg = lid / 32, lane = lid % 32;
+    threadgroup float part[8];
+    const float4 v = float4(*(const device half4*)(x + t * C + lid * 4));
+    float s = simd_sum(v.x + v.y + v.z + v.w);
+    if (lane == 0) part[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = 0;
+    for (int i = 0; i < 8; i++) mean += part[i];
+    mean /= C;
+    const float4 dv = v - mean;
+    s = simd_sum(dot(dv, dv));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) part[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float var = 0;
+    for (int i = 0; i < 8; i++) var += part[i];
+    const float r = metal::precise::rsqrt(var / C + 1e-5f);
+    *(device float4*)(out + t * C + lid * 4) = dv * r * *(const device float4*)(w + lid * 4) + *(const device float4*)(b + lid * 4);
+""")
+
+_repo_angles_kernel = mx.fast.metal_kernel(
+    name='idol_repo_angles',
+    input_names=['gc', 'wf_t', 'freqs', 'axis'],
+    output_names=['ang'],
+    source="""
+    const uint t = threadgroup_position_in_grid.x, lid = thread_position_in_threadgroup.x;
+    threadgroup float u[128];
+    threadgroup float delta[48];
+    const float g = gc[t * 256 + lid], c = gc[t * 256 + 128 + lid];
+    u[lid] = g / (1.0f + metal::precise::exp(-g)) * c;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 48) {
+        float acc = 0;
+        for (int k = 0; k < 128; k++) acc = metal::fma(u[k], wf_t[k * 48 + lid], acc);
+        delta[lid] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint o = lid; o < 512; o += 128) {
+        const uint h = o / 32, p = o % 32;
+        const float d = delta[h * 3 + axis[p]], f = freqs[p], ft = metal::precise::tanh(f);
+        ang[t * 512 + o] = (d * ft + d * (f - ft)) * float(M_PI_F);     // clamp_mul(d, f) * pi
+    }
+""")
+
+
 def clamp_mul(x, f):
     f_t = mx.tanh(f)
     return x * f_t + x * (f - f_t)
@@ -297,10 +353,26 @@ class RePo3DRotaryEmbedding(nn.Module):
         self.freqs_1 = mx.zeros((dim // 2,))
         self.freqs_2 = mx.zeros(((head_dim - 2 * dim) // 2,))
 
+    def prepare(self):
+        """After loading: the fused kernels' weight layouts (see _repo_angles_kernel)."""
+        assert self.num_heads == 16 and self.final_map.weight.shape == (48, 128) and self.norm.weight.shape == (1024,)
+        freqs = (self.freqs_0, self.freqs_1, self.freqs_2)
+        self.gc_t = mx.contiguous(mx.concatenate([self.gate_map.weight, self.content_map.weight]).T)
+        self.final_t = mx.contiguous(self.final_map.weight.T)
+        self.freqs = mx.concatenate(freqs)
+        self.axis = mx.array([i for i, f in enumerate(freqs) for _ in range(f.size)], dtype=mx.int32)
+
     def __call__(self, x):
         """-> rotation angles [B, L, H, head_dim / 2]"""
+        if 'gc_t' in self and x.dtype == F16:
+            B, L, C = x.shape
+            h = _repo_norm_kernel(inputs=[x, self.norm.weight, self.norm.bias], grid=(B * L * 256, 1, 1),
+                                  threadgroup=(256, 1, 1), output_shapes=[(B, L, C)], output_dtypes=[F32])[0]
+            return _repo_angles_kernel(inputs=[matmul32(h, self.gc_t), self.final_t, self.freqs, self.axis],
+                                       grid=(B * L * 128, 1, 1), threadgroup=(128, 1, 1),
+                                       output_shapes=[(B, L, self.num_heads, 32)], output_dtypes=[F32])[0]
         h = self.norm(x.astype(F32))
-        gate_content = matmul32(h, mx.concatenate([self.gate_map.weight, self.content_map.weight]))   # one matmul
+        gate_content = matmul32(h, mx.concatenate([self.gate_map.weight, self.content_map.weight]).T)   # one matmul
         gate, content = mx.split(gate_content, 2, axis=-1)
         out = self.final_map(nn.silu(gate) * content)
         B, L, _ = out.shape
@@ -451,6 +523,8 @@ def load_denoiser(path, args):
     pos_pe = torch.from_numpy(np.array(model.pos_pe))
     model._pos_emb = mx.array(PcdAbsolutePositionEmbedder(model.model_channels)(pos_pe).numpy())
     model.to_f16()
+    for repo in model.noise_repo_layers + model.context_repo_layers + model.repo_layers:
+        repo.prepare()
     mx.eval(model.parameters())
     return model
 

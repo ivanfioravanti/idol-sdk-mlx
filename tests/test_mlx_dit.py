@@ -43,6 +43,18 @@ def test_attention_kernel():
         assert rel(ref, out) < 1e-3, (L, rel(ref, out))   # FP16 output rounding
 
 
+def test_repo_kernels():
+    repo = mlx_dit.RePo3DRotaryEmbedding(1024, 16, 64)
+    for f in ('freqs_0', 'freqs_1', 'freqs_2'):
+        setattr(repo, f, mx.random.uniform(0.5, 2.0, getattr(repo, f).shape))
+    repo.norm.weight, repo.norm.bias = mx.random.uniform(0.5, 1.5, (1024,)), mx.random.normal((1024,)) * 0.1
+    x = (mx.random.normal((2, 300, 1024)) * 3 + 1).astype(mx.float16)
+    ref = repo(x)                  # MLX ops
+    repo.prepare()
+    out = repo(x)                  # fused kernels
+    assert float(mx.linalg.norm((out - ref).flatten()) / mx.linalg.norm(ref.flatten())) < 1e-6
+
+
 def test_linear_full_fp32():
     layer = mlx_dit.Linear(1024, 512)
     x = mx.random.normal((4096, 1024))
@@ -53,5 +65,6 @@ def test_linear_full_fp32():
 if __name__ == '__main__':
     test_rope_rmsnorm_kernel()
     test_attention_kernel()
+    test_repo_kernels()
     test_linear_full_fp32()
     print('ok')
