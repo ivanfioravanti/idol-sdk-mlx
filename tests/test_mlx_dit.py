@@ -80,6 +80,19 @@ def test_gemm_bias_kernel():
         assert np.linalg.norm(np.array(out, np.float64) - ref) / np.linalg.norm(ref) < 1e-3
 
 
+def test_gemm_epilogues():
+    gelu = mlx_dit.nn.GELU(approx='tanh')
+    x = (mx.random.normal((2, 600, 1024)) * 2).astype(mx.float16)
+    res = (mx.random.normal((2, 600, 1024)) * 3).astype(mx.float16)
+    gate = (mx.random.normal((2, 1, 1024)) * 0.5).astype(mx.float16)
+    w1, w2 = [(mx.random.normal(s) * s[0] ** -0.5).astype(mx.float16) for s in ((1024, 4096), (4096, 1024))]
+    b1, b2 = [(mx.random.normal((n,)) * 0.3).astype(mx.float16) for n in (4096, 1024)]
+    h = mlx_dit.gemm_bias(x, w1, b1, 'gelu')
+    assert bool(mx.array_equal(h, mx.compile(gelu)(mx.addmm(b1, x, w1))))
+    out = mlx_dit.gemm_bias(h, w2, b2, 'gate_res', gate, res)
+    assert bool(mx.array_equal(out, mx.compile(lambda h: res + mx.addmm(b2, h, w2) * gate)(h)))
+
+
 def test_linear_full_fp32():
     layer = mlx_dit.Linear(1024, 512)
     x = mx.random.normal((4096, 1024))
@@ -93,5 +106,6 @@ if __name__ == '__main__':
     test_repo_kernels()
     test_norm_mod_kernel()
     test_gemm_bias_kernel()
+    test_gemm_epilogues()
     test_linear_full_fp32()
     print('ok')
