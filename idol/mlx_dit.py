@@ -182,36 +182,29 @@ def norm32(norm, x):
     return norm(x.astype(F32)).astype(x.dtype)
 
 
-# layers.apply_rotary_emb then MultiHeadRMSNorm on q and k, fused: one SIMD group per (token, head, q or k), one
-# thread per rotation pair. Rotates in FP32 and rounds to FP16 (torch's type_as), normalises in FP32, and writes the
-# [B, H, L, D] layout SDPA takes. As separate MLX ops this was ~30% of a block for memory-bound work.
+# layers.apply_rotary_emb then MultiHeadRMSNorm on q and k, fused: one SIMD group per (token, head), one thread per
+# rotation pair of both q and k (one angle read, one sincos). Rotates in FP32 and rounds to FP16 (torch's type_as),
+# normalises in FP32, and writes the [B, H, L, D] layout SDPA takes. As separate MLX ops this was ~30% of a block for
+# memory-bound work.
 _rope_rmsnorm_kernel = mx.fast.metal_kernel(
     name='idol_rope_rmsnorm',
     input_names=['qkv', 'ang', 'gamma_q', 'gamma_k'],
     output_names=['q', 'k'],
     source="""
-    uint i = thread_position_in_grid.x;               // rotation pair: elements 2i, 2i + 1 of the 64-wide head
-    uint H = gamma_q_shape[0];
-    uint which = thread_position_in_grid.y / H;       // 0: q, 1: k
-    uint h = thread_position_in_grid.y % H;
-    uint t = thread_position_in_grid.z;               // b * L + token
-    uint L = qkv_shape[1];
-    uint src = ((t * 3 + which) * H + h) * 64 + 2 * i;
-    float x0 = qkv[src], x1 = qkv[src + 1];
-    float a = ang[(t * H + h) * 32 + i];
-    float c = metal::precise::cos(a), s = metal::precise::sin(a);
-    float y0 = float(half(x0 * c - x1 * s));
-    float y1 = float(half(x0 * s + x1 * c));
-    float norm = metal::max(metal::sqrt(simd_sum(y0 * y0 + y1 * y1)), 1e-12f);
-    uint g = h * 64 + 2 * i;
-    uint dst = (((t / L) * H + h) * L + t % L) * 64 + 2 * i;
-    if (which == 0) {
-        q[dst] = half(y0 / norm * gamma_q[g] * 8.0f);
-        q[dst + 1] = half(y1 / norm * gamma_q[g + 1] * 8.0f);
-    } else {
-        k[dst] = half(y0 / norm * gamma_k[g] * 8.0f);
-        k[dst + 1] = half(y1 / norm * gamma_k[g + 1] * 8.0f);
-    }
+    const uint i = thread_position_in_grid.x;         // rotation pair: elements 2i, 2i + 1 of the 64-wide head
+    const uint h = thread_position_in_grid.y, t = thread_position_in_grid.z;    // head, b * L + token
+    const uint H = gamma_q_shape[0], L = qkv_shape[1];
+    const uint src = (t * 3 * H + h) * 64 + 2 * i;
+    const half2 xq = *(const device half2*)(qkv + src), xk = *(const device half2*)(qkv + src + H * 64);
+    const float a = ang[(t * H + h) * 32 + i];
+    const float c = metal::precise::cos(a), s = metal::precise::sin(a);
+    const float q0 = float(half(float(xq[0]) * c - float(xq[1]) * s)), q1 = float(half(float(xq[0]) * s + float(xq[1]) * c));
+    const float k0 = float(half(float(xk[0]) * c - float(xk[1]) * s)), k1 = float(half(float(xk[0]) * s + float(xk[1]) * c));
+    const float nq = metal::max(metal::sqrt(simd_sum(q0 * q0 + q1 * q1)), 1e-12f);
+    const float nk = metal::max(metal::sqrt(simd_sum(k0 * k0 + k1 * k1)), 1e-12f);
+    const uint g = h * 64 + 2 * i, dst = (((t / L) * H + h) * L + t % L) * 64 + 2 * i;
+    *(device half2*)(q + dst) = half2(half(q0 / nq * gamma_q[g] * 8.0f), half(q1 / nq * gamma_q[g + 1] * 8.0f));
+    *(device half2*)(k + dst) = half2(half(k0 / nk * gamma_k[g] * 8.0f), half(k1 / nk * gamma_k[g + 1] * 8.0f));
 """)
 
 
@@ -219,7 +212,7 @@ def rope_rmsnorm(qkv, ang, gamma_q, gamma_k):
     """qkv [B, L, 3, H, 64] FP16, ang [B, L, H, 32] FP32 -> rotated, RMS-normalised q, k, each [B, H, L, 64] FP16"""
     B, L, _, H, D = qkv.shape
     assert D == 64 and qkv.dtype == F16
-    return _rope_rmsnorm_kernel(inputs=[qkv, ang, gamma_q, gamma_k], grid=(32, 2 * H, B * L), threadgroup=(32, 8, 1),
+    return _rope_rmsnorm_kernel(inputs=[qkv, ang, gamma_q, gamma_k], grid=(32, H, B * L), threadgroup=(32, 16, 1),
                                 output_shapes=[(B, H, L, D)] * 2, output_dtypes=[F16] * 2)
 
 
@@ -237,10 +230,10 @@ _ATTN_SOURCE = """
 
     const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     const int qb = threadgroup_position_in_grid.x, h = threadgroup_position_in_grid.y, b = threadgroup_position_in_grid.z;
-    const int H = q_shape[1], L = q_shape[2], HD = H * D;
+    const int H = q_shape[1], LQ = q_shape[2], L = k_shape[2], HD = H * D;     // LQ queries, L keys
     const short fm = (lane / 4 & 4) + (lane / 2) % 4, fn = (lane / 4 & 2) * 2 + (lane % 2) * 2;  // this lane's fragment row, cols
 
-    const device half* Q = q + (long)(b * H + h) * L * D;
+    const device half* Q = q + (long)(b * H + h) * LQ * D;
     const device half* K = k + (long)(b * H + h) * L * D;
     const device half* V = qkv + (long)b * L * 3 * HD + 2 * HD + h * D;    // row stride 3 * HD
     const float scale = scale_[0] * M_LOG2E_F;
@@ -252,7 +245,7 @@ _ATTN_SOURCE = """
     const int row0 = qb * BQ + sg * TQ * 8;
     #pragma clang loop unroll(full)
     for (int i = 0; i < TQ; i++) {
-        const int r = metal::min(row0 + i * 8 + fm, L - 1);
+        const int r = metal::min(row0 + i * 8 + fm, LQ - 1);
         #pragma clang loop unroll(full)
         for (int d = 0; d < TD; d++) {
             const half2 x = *(const device half2*)(Q + (long)r * D + d * 8 + fn);
@@ -341,11 +334,11 @@ _ATTN_SOURCE = """
     #pragma clang loop unroll(full)
     for (int i = 0; i < TQ; i++) {
         const int r = row0 + i * 8 + fm;
-        if (r >= L) continue;
+        if (r >= LQ) continue;
         #pragma clang loop unroll(full)
         for (int d = 0; d < TD; d++) {
             thread auto& e = Of[i][d].thread_elements();
-            *(device half2*)(out + ((long)b * L + r) * HD + h * D + d * 8 + fn) = half2(half(e[0] / s[i]), half(e[1] / s[i]));
+            *(device half2*)(out + ((long)b * LQ + r) * HD + h * D + d * 8 + fn) = half2(half(e[0] / s[i]), half(e[1] / s[i]));
         }
     }
 """
@@ -360,14 +353,15 @@ _attn_kernels = {
 
 
 def attention(q, k, qkv, scale, key_bias=None, bias_start=0):
-    """q, k [B, H, L, 64] FP16, qkv [B, L, 3, H, 64] FP16 (v = qkv[:, :, 2]), key_bias [L] (added to the scores, zero
-    before key bias_start) or None -> softmax(q k^T * scale + key_bias) v as [B, L, H * 64] FP16"""
-    B, H, L, D = q.shape
+    """q [B, H, LQ, 64], k [B, H, L, 64] FP16, qkv [B, L, 3, H, 64] FP16 (v = qkv[:, :, 2]), key_bias [L] (added to the
+    scores, zero before key bias_start) or None -> softmax(q k^T * scale + key_bias) v as [B, LQ, H * 64] FP16"""
+    B, H, L, D = k.shape
+    LQ = q.shape[2]
     assert D == 64 and q.dtype == k.dtype == qkv.dtype == F16
     inputs = [q, k, qkv, mx.array([scale], F32)] + ([key_bias] if key_bias is not None else [])
-    return _attn_kernels[key_bias is not None](inputs=inputs, grid=((L + 63) // 64 * 128, H, B), threadgroup=(128, 1, 1),
+    return _attn_kernels[key_bias is not None](inputs=inputs, grid=((LQ + 63) // 64 * 128, H, B), threadgroup=(128, 1, 1),
                                                template=[('BIAS_START', bias_start if key_bias is not None else L)],
-                                               output_shapes=[(B, L, H * D)], output_dtypes=[F16])[0]
+                                               output_shapes=[(B, LQ, H * D)], output_dtypes=[F16])[0]
 
 
 # The two ends of a RePo layer, fused. LayerNorm of FP16 tokens in FP32 in one pass (one threadgroup per token, 4
@@ -553,11 +547,13 @@ class RopeMultiHeadAttention(nn.Module):
         self.k_norm = MultiHeadRMSNorm(self.head_dim, num_heads)
         self.out = Linear(channels, channels)
 
-    def __call__(self, x, rope, mask=None, mask_start=0, project=True):
-        """project=False: without the output projection"""
+    def __call__(self, x, rope, mask=None, mask_start=0, project=True, keep=None):
+        """project=False: without the output projection. keep (n, m): only the first n and the last m tokens query"""
         B, L, C = x.shape
         qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
         q, k = rope_rmsnorm(qkv, rope, self.q_norm.gamma, self.k_norm.gamma)
+        if keep is not None:
+            q = mx.concatenate([q[:, :, :keep[0]], q[:, :, L - keep[1]:]], axis=2)
         a = attention(q, k, qkv, self.head_dim ** -0.5, mask, mask_start)
         return self.out(a) if project else a
 
@@ -573,8 +569,12 @@ class UnifiedTransformerBlock(nn.Module):
         if modulation:
             self.shift_table = mx.zeros((1, 6 * channels))
 
-    def __call__(self, x, mod, rope, mask=None, mask_start=0):
+    def __call__(self, x, mod, rope, mask=None, mask_start=0, keep=None):
+        """keep (n, m): return only the first n and the last m tokens (the others still serve as keys and values)"""
+        def kept(t):
+            return t if keep is None else mx.concatenate([t[:, :keep[0]], t[:, t.shape[1] - keep[1]:]], axis=1)
         if not self.modulation:
+            assert keep is None
             x = x + self.attn(norm32(self.norm1, x), rope)
             return x + self.mlp(norm32(self.norm2, x))
         mod = (mod + self.shift_table.astype(mod.dtype))[:, None]
@@ -583,11 +583,11 @@ class UnifiedTransformerBlock(nn.Module):
         B, L, C = x.shape
         if x.dtype == F16 and 'weight_t' in out and all(Linear._gemm_ok(B * L, *m.weight_t.shape) for m in (out, fc1, fc2)):
             # the gated residuals and the GELU in the GEMM epilogues (bit-identical to the unfused ops)
-            a = self.attn(norm_mod(x, scale_msa, shift_msa), rope, mask, mask_start, project=False)
-            x = gemm_bias(a, out.weight_t, out.bias, 'gate_res', gate_msa, x)
+            a = self.attn(norm_mod(x, scale_msa, shift_msa), rope, mask, mask_start, project=False, keep=keep)
+            x = gemm_bias(a, out.weight_t, out.bias, 'gate_res', gate_msa, kept(x))
             h = gemm_bias(norm_mod(x, scale_mlp, shift_mlp), fc1.weight_t, fc1.bias, 'gelu')
             return gemm_bias(h, fc2.weight_t, fc2.bias, 'gate_res', gate_mlp, x)
-        x = x + self.attn(norm_mod(x, scale_msa, shift_msa), rope, mask, mask_start) * gate_msa
+        x = kept(x) + self.attn(norm_mod(x, scale_msa, shift_msa), rope, mask, mask_start, keep=keep) * gate_msa
         return x + self.mlp(norm_mod(x, scale_mlp, shift_mlp)) * gate_mlp
 
 
@@ -676,8 +676,11 @@ class LatentSeqMMFlowModel(nn.Module):
         """latent_stream() output and condition() output -> the velocity"""
         h_x, h_cam, t_emb, t_mod = stream
         h = mx.concatenate([h_x, h_cond, h_cam], axis=1)
-        for repo, block in zip(self.repo_layers, self.blocks):
-            h = block(h, t_mod, repo(h), mask, h_x.shape[1])    # the mask (key bias) is zero on the latent tokens
+        n_x, n_cam = h_x.shape[1], h_cam.shape[1]
+        for i, (repo, block) in enumerate(zip(self.repo_layers, self.blocks)):
+            # the mask (key bias) is zero on the latent tokens; the last block's image-token outputs are not used, so
+            # there the image tokens are only keys and values (each query row's result is independent of the others)
+            h = block(h, t_mod, repo(h), mask, n_x, keep=(n_x, n_cam) if i == len(self.blocks) - 1 else None)
 
         h_x = mx.fast.layer_norm(h[:, :h_x.shape[1]].astype(F32), None, None, 1e-5)
         h_cam = mx.fast.layer_norm(h[:, -h_cam.shape[1]:].astype(F32), None, None, 1e-5)

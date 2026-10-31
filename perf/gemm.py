@@ -20,8 +20,35 @@ SRC = """
     for (int i = 0; i < FI; i++)
         _Pragma("clang loop unroll(full)") for (int j = 0; j < FJ; j++) C[i][j] = simdgroup_float8x8(0);
 
+#if PF
+    constexpr int PA = BM * BK / 8 / NT, PB = BK * BN / 8 / NT;
+    uint4 ra[PA], rb[PB];
+    auto fetch = [&](int k0) {
+        _Pragma("clang loop unroll(full)") for (int p = 0; p < PA; p++) {
+            const int e = p * NT + tid, r = e / (BK / 8), c = e % (BK / 8) * 8;
+            ra[p] = *(const device uint4*)(x + (long)metal::min(m0 + r, M - 1) * K + k0 + c);
+        }
+        _Pragma("clang loop unroll(full)") for (int p = 0; p < PB; p++) {
+            const int e = p * NT + tid, r = e / (BN / 8), c = e % (BN / 8) * 8;
+            rb[p] = *(const device uint4*)(w + (long)(k0 + r) * N + n0 + c);
+        }
+    };
+    fetch(0);
+#endif
     for (int k0 = 0; k0 < K; k0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+#if PF
+        _Pragma("clang loop unroll(full)") for (int p = 0; p < PA; p++) {
+            const int e = p * NT + tid, r = e / (BK / 8), c = e % (BK / 8) * 8;
+            *(threadgroup uint4*)(As + r * LDA + c) = ra[p];
+        }
+        _Pragma("clang loop unroll(full)") for (int p = 0; p < PB; p++) {
+            const int e = p * NT + tid, r = e / (BN / 8), c = e % (BN / 8) * 8;
+            *(threadgroup uint4*)(Bs + r * LDB + c) = rb[p];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (k0 + BK < K) fetch(k0 + BK);
+#else
         // A tile: BM rows x BK halfs, 8 halfs (16 bytes) per thread per pass
         #pragma clang loop unroll(full)
         for (int p = 0; p < BM * BK / 8 / NT; p++) {
@@ -35,6 +62,7 @@ SRC = """
             *(threadgroup uint4*)(Bs + r * LDB + c) = *(const device uint4*)(w + (long)(k0 + r) * N + n0 + c);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif
         #pragma clang loop unroll(full)
         for (int kk = 0; kk < BK / 8; kk++) {
             simdgroup_half8x8 bf[FJ];
@@ -63,12 +91,12 @@ SRC = """
 _k = {}
 
 
-def gemm(x, w, b, wm=2, wn=2, fi=8, fj=4, bk=32, pada=8, padb=8):
+def gemm(x, w, b, wm=2, wn=2, fi=8, fj=4, bk=32, pada=8, padb=8, pf=0):
     M, K = x.shape
     N = w.shape[1]
-    key = (wm, wn, fi, fj, bk, pada, padb)
+    key = (wm, wn, fi, fj, bk, pada, padb, pf)
     if key not in _k:
-        hdr = f'constexpr int WM = {wm}, WN = {wn}, FI = {fi}, FJ = {fj}, BK = {bk}, PADA = {pada}, PADB = {padb};\n'
+        hdr = f'#define PF {pf}\nconstexpr int WM = {wm}, WN = {wn}, FI = {fi}, FJ = {fj}, BK = {bk}, PADA = {pada}, PADB = {padb};\n'
         _k[key] = mx.fast.metal_kernel(name='gemm_' + '_'.join(map(str, key)), input_names=['x', 'w', 'b'],
                                        output_names=['out'], source=hdr + SRC)
     bm, bn = wm * fi * 8, wn * fj * 8
