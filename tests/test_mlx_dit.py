@@ -30,15 +30,18 @@ def test_rope_rmsnorm_kernel():
 
 def test_attention_kernel():
     B, H, D = 2, 16, 64
-    for L, with_bias in ((300, False), (77, True), (2, False)):     # lengths off the 64-query / 32-key blocks
+    # lengths off the 64-query / 32-key blocks; a bias that is zero before key bias_start (as the unconditional pass)
+    for L, with_bias, bias_start in ((300, False, 0), (77, True, 0), (2, False, 0), (300, True, 256), (300, True, 270)):
         qkv = mx.random.normal((B, L, 3, H, D)).astype(mx.float16)
         q, k = [(mx.random.normal((B, H, L, D)) * 2).astype(mx.float16) for _ in range(2)]
         bias = mx.random.uniform(-3, 3, (L,)).astype(mx.float16) if with_bias else None
+        if with_bias and bias_start:
+            bias[:bias_start] = 0
         s = (q.astype(mx.float32) @ k.astype(mx.float32).transpose(0, 1, 3, 2)) * 0.125
         if bias is not None:
             s = s + bias.astype(mx.float32)
         ref = (mx.softmax(s, axis=-1) @ qkv[:, :, 2].astype(mx.float32).transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
-        out = mlx_dit.attention(q, k, qkv, 0.125, bias).astype(mx.float32)
+        out = mlx_dit.attention(q, k, qkv, 0.125, bias, bias_start).astype(mx.float32)
         ref, out = torch.from_numpy(np.array(ref.reshape(B, L, H * D))), torch.from_numpy(np.array(out))
         assert rel(ref, out) < 1e-3, (L, rel(ref, out))   # FP16 output rounding
 
