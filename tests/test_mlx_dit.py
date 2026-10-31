@@ -68,6 +68,18 @@ def test_norm_mod_kernel():
     print('norm_mod max abs diff', float(mx.abs(out - ref).max()), 'mismatch fraction', float((out != ref).mean()))
 
 
+def test_gemm_bias_kernel():
+    for M, K, N in ((400, 1024, 3072), (1100, 1024, 1024), (2050, 4096, 1024), (300, 1024, 4096)):   # rows off the tiles
+        x = mx.random.normal((2, M, K)).astype(mx.float16)
+        w = (mx.random.normal((K, N)) * K ** -0.5).astype(mx.float16)
+        b = mx.random.normal((N,)).astype(mx.float16)
+        out = mlx_dit.gemm_bias(x, w, b)
+        assert mlx_dit.Linear._gemm_ok(2 * M, K, N)
+        assert bool(mx.array_equal(out, mx.addmm(b, x, w))), (M, K, N)   # same MMAs, same order, same epilogue
+        ref = np.array(x, np.float64) @ np.array(w, np.float64) + np.array(b, np.float64)
+        assert np.linalg.norm(np.array(out, np.float64) - ref) / np.linalg.norm(ref) < 1e-3
+
+
 def test_linear_full_fp32():
     layer = mlx_dit.Linear(1024, 512)
     x = mx.random.normal((4096, 1024))
@@ -80,5 +92,6 @@ if __name__ == '__main__':
     test_attention_kernel()
     test_repo_kernels()
     test_norm_mod_kernel()
+    test_gemm_bias_kernel()
     test_linear_full_fp32()
     print('ok')

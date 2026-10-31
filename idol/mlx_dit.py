@@ -44,12 +44,95 @@ def matmul32(x, w):
     return x_hi @ w_hi + (x_hi @ w_lo + x_lo @ w_hi)
 
 
+# FP16 GEMM + bias, x [M, K] @ w [K, N] + b: the block linears' shapes (M ~8k-12k, K 1024 / 4096, N 1024-4096) run
+# 4-10% faster than mx.addmm, whose tile for them is 64 x 64 with 2 simdgroups and a K step of 16. Here 64 x 64 with 4
+# simdgroups of 32 x 32 and a K step of 32: half the barriers per K, more simdgroups to hide the loads. The same
+# 8x8 MMAs accumulate in FP32 over k in the same order, and the bias is added in FP32 before rounding, as in MLX's
+# addmm epilogue: the output is bit-identical to mx.addmm.
+_GEMM_SOURCE = """
+    constexpr int WM = 2, WN = 2, FI = 4, FJ = 4, BK = 32, BM = WM * FI * 8, BN = WN * FJ * 8, LDA = BK + 8, LDB = BN + 8;
+    constexpr int NT = WM * WN * 32;
+    threadgroup half As[BM * LDA];
+    threadgroup half Bs[BK * LDB];
+    const int M = x_shape[0], K = x_shape[1], N = w_shape[1];
+    const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup, tid = sg * 32 + lane;
+    const int sm = sg / WN, sn = sg % WN;
+    const int m0 = threadgroup_position_in_grid.y * BM, n0 = threadgroup_position_in_grid.x * BN;
+    const short fm = (lane / 4 & 4) + (lane / 2) % 4, fn = (lane / 4 & 2) * 2 + (lane % 2) * 2;
+
+    simdgroup_float8x8 C[FI][FJ];
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < FI; i++)
+        _Pragma("clang loop unroll(full)") for (int j = 0; j < FJ; j++) C[i][j] = simdgroup_float8x8(0);
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (int p = 0; p < BM * BK / 8 / NT; p++) {      // 8 halfs (16 bytes) per thread and pass
+            const int e = p * NT + tid, r = e / (BK / 8), c = e % (BK / 8) * 8;
+            *(threadgroup uint4*)(As + r * LDA + c) = *(const device uint4*)(x + (long)metal::min(m0 + r, M - 1) * K + k0 + c);
+        }
+        #pragma clang loop unroll(full)
+        for (int p = 0; p < BK * BN / 8 / NT; p++) {
+            const int e = p * NT + tid, r = e / (BN / 8), c = e % (BN / 8) * 8;
+            *(threadgroup uint4*)(Bs + r * LDB + c) = *(const device uint4*)(w + (long)(k0 + r) * N + n0 + c);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (int kk = 0; kk < BK / 8; kk++) {
+            simdgroup_half8x8 bf[FJ];
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < FJ; j++) simdgroup_load(bf[j], Bs + kk * 8 * LDB + sn * FJ * 8 + j * 8, LDB);
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < FI; i++) {
+                simdgroup_half8x8 af;
+                simdgroup_load(af, As + (sm * FI * 8 + i * 8) * LDA + kk * 8, LDA);
+                _Pragma("clang loop unroll(full)") for (int j = 0; j < FJ; j++) simdgroup_multiply_accumulate(C[i][j], af, bf[j], C[i][j]);
+            }
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < FI; i++) {
+        const int r = m0 + sm * FI * 8 + i * 8 + fm;
+        if (r >= M) continue;
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < FJ; j++) {
+            const int c = n0 + sn * FJ * 8 + j * 8 + fn;
+            thread auto& e = C[i][j].thread_elements();
+            EPILOGUE
+        }
+    }
+"""
+_gemm_kernel = mx.fast.metal_kernel(
+    name='idol_gemm_bias', input_names=['x', 'w', 'b'], output_names=['out'],
+    source=_GEMM_SOURCE.replace('EPILOGUE', '*(device half2*)(out + (long)r * N + c) = '
+                                            'half2(half(e[0] + float(b[c])), half(e[1] + float(b[c + 1])));'))
+
+
+def gemm_bias(x, w, b):
+    """x [..., K] @ w [K, N] + b, FP16 (K % 32 == 0, N % 64 == 0); bit-identical to mx.addmm(b, x, w)"""
+    K, N = w.shape
+    M = x.size // K
+    out = _gemm_kernel(inputs=[x.reshape(M, K), w, b], grid=(N // 64 * 128, (M + 63) // 64, 1), threadgroup=(128, 1, 1),
+                       output_shapes=[(M, N)], output_dtypes=[F16])[0]
+    return out.reshape(*x.shape[:-1], N)
+
+
 class Linear(nn.Linear):
     """nn.Linear, at full precision for FP32 inputs (matmul32). FP16 is exact in TF32 as is. After
-    LatentSeqMMFlowModel.to_f16() the weight is held as weight_t [in, out], contiguous: MLX's GEMM is ~5% faster on it
-    than on the weight.T view."""
+    LatentSeqMMFlowModel.to_f16() the weight is held as weight_t [in, out], contiguous (MLX's GEMM is ~5% faster on it
+    than on the weight.T view), and FP16 inputs with a bias run gemm_bias, except where K is large for the output
+    on the shapes where MLX's addmm takes its large-GEMM tiles (M N >= 2^20 and K <= 2 max(M, N)): it sums the small
+    ones (the two-token unconditional image tokens) in another order, and they cost nothing."""
+    @staticmethod
+    def _gemm_ok(M, K, N):
+        return K % 32 == 0 and N % 64 == 0 and M * N >= 1 << 20 and K <= 2 * max(M, N)
+
     def __call__(self, x):
         if 'weight_t' in self:
+            K, N = self.weight_t.shape
+            if 'bias' in self and x.dtype == F16 and self._gemm_ok(x.size // K, K, N):
+                return gemm_bias(x, self.weight_t, self.bias)
             return mx.addmm(self.bias, x, self.weight_t) if 'bias' in self else x @ self.weight_t
         if x.dtype != F32:
             return super().__call__(x)
