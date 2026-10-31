@@ -178,9 +178,13 @@ div.sl-section { font-weight: 700 !important; }
 /* gr.Progress (the sampler's real steps) gets its own row under the status line: drawn over the status text it was
    cramped and its step counter clipped. Hidden when idle. */
 #sl-progress:not(:has(.wrap:not(.hide))) { display: none; }
-#sl-progress:has(.wrap:not(.hide)) { min-height: 58px; }
-#sl-progress .wrap { background: transparent !important; }
-#sl-progress .progress-text { font-size: 13px; transform: none !important; }  /* gradio shifts it out of view */
+#sl-progress:has(.wrap:not(.hide)) { min-height: 84px; }
+#sl-progress .wrap { background: transparent !important; bottom: 0 !important; padding: 6px 0 !important;
+  overflow: visible !important; }   /* gradio clips it 8 px short of the row: cut the counter's lower half */
+/* gradio pins the step counter to the label's line (overlapping it on narrow windows) and shifts it out of view:
+   put it on its own line under the bar */
+#sl-progress .progress-text { font-size: 13px; position: static !important; transform: none !important; order: 2; }
+#sl-progress .progress-level { order: 1; }
 #sl-progress .progress-level-inner { font-size: 13px; }
 #sl-progress .progress-bar-wrap { width: 100% !important; height: 8px; }
 #sl-settings { margin-top: 0; }
