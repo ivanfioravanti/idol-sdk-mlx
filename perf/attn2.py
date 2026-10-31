@@ -5,7 +5,7 @@ import mlx.core as mx
 import numpy as np
 
 SRC = """
-    constexpr int D = 64, TD = 8, NSG = 4, TQ = 2, BQ = NSG * TQ * 8, BK = 32, TK = BK / 8, LD = D + LDPAD, LDT = BK + LDTPAD;
+    constexpr int D = 64, TD = 8, TQ = 2, BQ = NSG * TQ * 8, TK = BK / 8, LD = D + LDPAD, LDT = BK + LDTPAD;
 #if KT
     threadgroup half Ks[D * LDT];      // K block transposed [d][key]
 #else
@@ -191,9 +191,11 @@ def attention(q, k, qkv, scale, bias=None, bias_start=0, flags=()):
         defs = {f: int(f in flags) for f in ('PH', 'FOLD', 'BIAS0', 'KT', 'NOMAX')}
         if 'KT2' in flags:
             defs['KT'] = 2
-        defs['LDPAD'], defs['LDTPAD'] = 8, 8
+        defs['LDPAD'], defs['LDTPAD'], defs['NSG'], defs['BK'] = 8, 8, 4, 32
         for f in flags:
-            if f.startswith('LDTP'): defs['LDTPAD'] = int(f[4:])
+            if f.startswith('NSG'): defs['NSG'] = int(f[3:])
+            elif f.startswith('BK'): defs['BK'] = int(f[2:])
+            elif f.startswith('LDTP'): defs['LDTPAD'] = int(f[4:])
             elif f.startswith('LDP'): defs['LDPAD'] = int(f[3:])
         defs['BIAS'] = int(bias is not None)
         header = ''.join(f'#define {n} {v}\n' for n, v in defs.items())
@@ -208,7 +210,8 @@ def attention(q, k, qkv, scale, bias=None, bias_start=0, flags=()):
         kn = mx.sqrt((k.astype(mx.float32) ** 2).sum(-1)).max(-1, keepdims=True)
         bmax = 0.0 if bias is None else float(bias.astype(mx.float32).max())
         inputs += [(qn * kn * scale + bmax) * 1.4426950408889634]
-    return _k[key](inputs=inputs, grid=((L + 63) // 64 * 128, H, B), threadgroup=(128, 1, 1),
+    nsg = next((int(f[3:]) for f in flags if f.startswith('NSG')), 4)
+    return _k[key](inputs=inputs, grid=((L + nsg * 16 - 1) // (nsg * 16) * nsg * 32, H, B), threadgroup=(nsg * 32, 1, 1),
                    output_shapes=[(B, L, H * D)], output_dtypes=[mx.float16])[0]
 
 
