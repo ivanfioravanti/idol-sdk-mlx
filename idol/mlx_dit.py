@@ -103,18 +103,50 @@ _GEMM_SOURCE = """
         }
     }
 """
-_gemm_kernel = mx.fast.metal_kernel(
-    name='idol_gemm_bias', input_names=['x', 'w', 'b'], output_names=['out'],
-    source=_GEMM_SOURCE.replace('EPILOGUE', '*(device half2*)(out + (long)r * N + c) = '
-                                            'half2(half(e[0] + float(b[c])), half(e[1] + float(b[c + 1])));'))
+# Epilogues, each the FP16 op sequence of the MLX ops it replaces, every op rounded to FP16 (no FMA contraction; MLX's
+# tanh of FP16 runs in FP32), so the output stays bit-identical: y = addmm; gelu: nn.GELU(approx='tanh'),
+# 0.5 * y * (1 + tanh(sqrt(2 / pi) * (y + 0.044715 * y ** 3))); gate_res: res + y * gate.
+_GEMM_EPILOGUES = {
+    'bias': ('', 'const half y = half(e[t] + float(b[c + t]));'),
+    'gelu': ('', """const half y = half(e[t] + float(b[c + t]));
+                const half a = half(0.5h) * y, cube = metal::pow(y, half(3.0h));
+                const half inner = half(0.7978845608028654h) * (y + half(0.044715h) * cube);
+                y_out = a * (half(1.0h) + half(metal::precise::tanh(float(inner))));"""),
+    'gate_res': ('const long gi = (long)(r / res_shape[1]) * N;',
+                 'const half y = half(e[t] + float(b[c + t]));\n                y_out = res[(long)r * N + c + t] + y * gate[gi + c + t];'),
+}
 
 
-def gemm_bias(x, w, b):
-    """x [..., K] @ w [K, N] + b, FP16 (K % 32 == 0, N % 64 == 0); bit-identical to mx.addmm(b, x, w)"""
+def _gemm_epilogue(name):
+    pre, body = _GEMM_EPILOGUES[name]
+    if 'y_out' not in body:
+        body += ' y_out = y;'
+    return f"""{pre}
+            half2 o;
+            #pragma clang loop unroll(full)
+            for (int t = 0; t < 2; t++) {{
+                #pragma METAL fp contract(off)
+                half y_out;
+                {body}
+                o[t] = y_out;
+            }}
+            *(device half2*)(out + (long)r * N + c) = o;"""
+
+
+_gemm_kernels = {
+    name: mx.fast.metal_kernel(name=f'idol_gemm_{name}', input_names=['x', 'w', 'b'] + (['gate', 'res'] if name == 'gate_res' else []),
+                               output_names=['out'], source=_GEMM_SOURCE.replace('EPILOGUE', _gemm_epilogue(name)))
+    for name in _GEMM_EPILOGUES}
+
+
+def gemm_bias(x, w, b, epilogue='bias', gate=None, res=None):
+    """x [..., K] @ w [K, N] + b, FP16 (K % 32 == 0, N % 64 == 0); bit-identical to mx.addmm(b, x, w). epilogue 'gelu':
+    then nn.GELU(approx='tanh'); 'gate_res': res + (x @ w + b) * gate, x and res [B, L, ...], gate [B, 1, N]"""
     K, N = w.shape
     M = x.size // K
-    out = _gemm_kernel(inputs=[x.reshape(M, K), w, b], grid=(N // 64 * 128, (M + 63) // 64, 1), threadgroup=(128, 1, 1),
-                       output_shapes=[(M, N)], output_dtypes=[F16])[0]
+    extra = [gate, res] if epilogue == 'gate_res' else []
+    out = _gemm_kernels[epilogue](inputs=[x.reshape(M, K), w, b] + extra, grid=(N // 64 * 128, (M + 63) // 64, 1),
+                                  threadgroup=(128, 1, 1), output_shapes=[(M, N)], output_dtypes=[F16])[0]
     return out.reshape(*x.shape[:-1], N)
 
 
@@ -521,11 +553,13 @@ class RopeMultiHeadAttention(nn.Module):
         self.k_norm = MultiHeadRMSNorm(self.head_dim, num_heads)
         self.out = Linear(channels, channels)
 
-    def __call__(self, x, rope, mask=None, mask_start=0):
+    def __call__(self, x, rope, mask=None, mask_start=0, project=True):
+        """project=False: without the output projection"""
         B, L, C = x.shape
         qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
         q, k = rope_rmsnorm(qkv, rope, self.q_norm.gamma, self.k_norm.gamma)
-        return self.out(attention(q, k, qkv, self.head_dim ** -0.5, mask, mask_start))
+        a = attention(q, k, qkv, self.head_dim ** -0.5, mask, mask_start)
+        return self.out(a) if project else a
 
 
 class UnifiedTransformerBlock(nn.Module):
@@ -545,6 +579,14 @@ class UnifiedTransformerBlock(nn.Module):
             return x + self.mlp(norm32(self.norm2, x))
         mod = (mod + self.shift_table.astype(mod.dtype))[:, None]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mx.split(mod, 6, axis=-1)
+        out, fc1, fc2 = self.attn.out, self.mlp.mlp[0], self.mlp.mlp[2]
+        B, L, C = x.shape
+        if x.dtype == F16 and 'weight_t' in out and all(Linear._gemm_ok(B * L, *m.weight_t.shape) for m in (out, fc1, fc2)):
+            # the gated residuals and the GELU in the GEMM epilogues (bit-identical to the unfused ops)
+            a = self.attn(norm_mod(x, scale_msa, shift_msa), rope, mask, mask_start, project=False)
+            x = gemm_bias(a, out.weight_t, out.bias, 'gate_res', gate_msa, x)
+            h = gemm_bias(norm_mod(x, scale_mlp, shift_mlp), fc1.weight_t, fc1.bias, 'gelu')
+            return gemm_bias(h, fc2.weight_t, fc2.bias, 'gate_res', gate_mlp, x)
         x = x + self.attn(norm_mod(x, scale_msa, shift_msa), rope, mask, mask_start) * gate_msa
         return x + self.mlp(norm_mod(x, scale_mlp, shift_mlp)) * gate_mlp
 
