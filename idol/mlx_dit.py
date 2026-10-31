@@ -108,14 +108,16 @@ def rope_rmsnorm(qkv, ang, gamma_q, gamma_k):
                                 output_shapes=[(B, H, L, D)] * 2, output_dtypes=[F16] * 2)
 
 
-# Flash attention for head_dim 64, faster here than mx.fast.scaled_dot_product_attention (27.3 -> 26.1 ms at 12,294
-# tokens, 13.1 -> 12.2 ms at 8,195 with the key bias): MLX's kernel gives each simdgroup 8 query rows and reloads Q and K
+# Flash attention for head_dim 64, faster here than mx.fast.scaled_dot_product_attention (27.3 -> 26.2 ms at 12,294
+# tokens, 13.1 -> 12.0 ms at 8,195 with the key bias): MLX's kernel gives each simdgroup 8 query rows and reloads Q and K
 # fragments from threadgroup memory for every MMA; here a simdgroup keeps 16 query rows of Q in registers, so each K / V
-# fragment feeds two MMAs. FP16 operands, FP32 scores, softmax and accumulation, the same online softmax as MLX. Reads
-# V straight from the qkv projection and writes [B, L, H * 64], the layout the output projection takes.
+# fragment feeds two MMAs. K is stored transposed in threadgroup memory ([d][key]): plain fragment loads are cheaper
+# than transposed ones. FP16 operands, FP32 scores, softmax and accumulation, the same online softmax as MLX. Reads
+# V straight from the qkv projection and writes [B, L, H * 64], the layout the output projection takes. The key bias is
+# zero before key BIAS_START (the latent tokens), so only the last key blocks add it, with the tail mask.
 _ATTN_SOURCE = """
     constexpr int D = 64, TD = 8, NSG = 4, TQ = 2, BQ = NSG * TQ * 8, BK = 32, TK = BK / 8, LD = D + 8;
-    threadgroup half Ks[BK * LD];      // K block [key][d], read transposed by simdgroup_load
+    threadgroup half Ks[D * BK];       // K block transposed [d][key]
     threadgroup half Vs[BK * LD];      // V block [key][d]
 
     const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
@@ -127,6 +129,7 @@ _ATTN_SOURCE = """
     const device half* K = k + (long)(b * H + h) * L * D;
     const device half* V = qkv + (long)b * L * 3 * HD + 2 * HD + h * D;    // row stride 3 * HD
     const float scale = scale_[0] * M_LOG2E_F;
+    const int kb_special = metal::min(L / BK, BIAS_START / BK);    // first key block with a bias or past L
 
     simdgroup_half8x8 Qf[TQ][TD];
     simdgroup_float8x8 Of[TQ][TD], Sf[TQ][TK];
@@ -152,7 +155,9 @@ _ATTN_SOURCE = """
         threadgroup_barrier(mem_flags::mem_threadgroup);
         #pragma clang loop unroll(full)
         for (int j = 0; j < PER; j += 4) {
-            *(threadgroup half4*)(Ks + lk * LD + ld0 + j) = key < L ? *(const device half4*)(K + (long)key * D + ld0 + j) : half4(0);
+            const half4 kv = key < L ? *(const device half4*)(K + (long)key * D + ld0 + j) : half4(0);
+            Ks[(ld0 + j) * BK + lk] = kv[0]; Ks[(ld0 + j + 1) * BK + lk] = kv[1];
+            Ks[(ld0 + j + 2) * BK + lk] = kv[2]; Ks[(ld0 + j + 3) * BK + lk] = kv[3];
             *(threadgroup half4*)(Vs + lk * LD + ld0 + j) = key < L ? *(const device half4*)(V + (long)key * 3 * HD + ld0 + j) : half4(0);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -165,12 +170,12 @@ _ATTN_SOURCE = """
             #pragma clang loop unroll(full)
             for (int c = 0; c < TK; c++) {
                 simdgroup_half8x8 kf;
-                simdgroup_load(kf, Ks + c * 8 * LD + d * 8, LD, ulong2(0, 0), true);
+                simdgroup_load(kf, Ks + d * 8 * BK + c * 8, BK);
                 _Pragma("clang loop unroll(full)") for (int i = 0; i < TQ; i++) simdgroup_multiply_accumulate(Sf[i][c], Qf[i][d], kf, Sf[i][c]);
             }
         }
 
-        const bool tail = (kb + 1) * BK > L;
+        const bool special = kb >= kb_special;
         #pragma clang loop unroll(full)
         for (int i = 0; i < TQ; i++) {
             float mx_ = m[i];
@@ -179,8 +184,8 @@ _ATTN_SOURCE = """
                 thread auto& e = Sf[i][c].thread_elements();
                 const int col = kb * BK + c * 8 + fn;
                 e[0] *= scale; e[1] *= scale;
-                KEY_BIAS
-                if (tail) {
+                if (special) {
+                    KEY_BIAS
                     if (col >= L) e[0] = -FLT_MAX;
                     if (col + 1 >= L) e[1] = -FLT_MAX;
                 }
@@ -234,18 +239,19 @@ _attn_kernels = {
         name=f'idol_attention{"_bias" if with_bias else ""}',
         input_names=['q', 'k', 'qkv', 'scale_'] + (['key_bias'] if with_bias else []), output_names=['out'],
         source=_ATTN_SOURCE.replace('KEY_BIAS', 'e[0] += M_LOG2E_F * float(key_bias[metal::min(col, L - 1)]);\n'
-                                                '                e[1] += M_LOG2E_F * float(key_bias[metal::min(col + 1, L - 1)]);'
+                                                '                    e[1] += M_LOG2E_F * float(key_bias[metal::min(col + 1, L - 1)]);'
                                     if with_bias else ''))
     for with_bias in (False, True)}
 
 
-def attention(q, k, qkv, scale, key_bias=None):
-    """q, k [B, H, L, 64] FP16, qkv [B, L, 3, H, 64] FP16 (v = qkv[:, :, 2]), key_bias [L] (added to the scores) or
-    None -> softmax(q k^T * scale + key_bias) v as [B, L, H * 64] FP16"""
+def attention(q, k, qkv, scale, key_bias=None, bias_start=0):
+    """q, k [B, H, L, 64] FP16, qkv [B, L, 3, H, 64] FP16 (v = qkv[:, :, 2]), key_bias [L] (added to the scores, zero
+    before key bias_start) or None -> softmax(q k^T * scale + key_bias) v as [B, L, H * 64] FP16"""
     B, H, L, D = q.shape
     assert D == 64 and q.dtype == k.dtype == qkv.dtype == F16
     inputs = [q, k, qkv, mx.array([scale], F32)] + ([key_bias] if key_bias is not None else [])
     return _attn_kernels[key_bias is not None](inputs=inputs, grid=((L + 63) // 64 * 128, H, B), threadgroup=(128, 1, 1),
+                                               template=[('BIAS_START', bias_start if key_bias is not None else L)],
                                                output_shapes=[(B, L, H * D)], output_dtypes=[F16])[0]
 
 
@@ -432,11 +438,11 @@ class RopeMultiHeadAttention(nn.Module):
         self.k_norm = MultiHeadRMSNorm(self.head_dim, num_heads)
         self.out = Linear(channels, channels)
 
-    def __call__(self, x, rope, mask=None):
+    def __call__(self, x, rope, mask=None, mask_start=0):
         B, L, C = x.shape
         qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
         q, k = rope_rmsnorm(qkv, rope, self.q_norm.gamma, self.k_norm.gamma)
-        return self.out(attention(q, k, qkv, self.head_dim ** -0.5, mask))
+        return self.out(attention(q, k, qkv, self.head_dim ** -0.5, mask, mask_start))
 
 
 class UnifiedTransformerBlock(nn.Module):
@@ -450,13 +456,13 @@ class UnifiedTransformerBlock(nn.Module):
         if modulation:
             self.shift_table = mx.zeros((1, 6 * channels))
 
-    def __call__(self, x, mod, rope, mask=None):
+    def __call__(self, x, mod, rope, mask=None, mask_start=0):
         if not self.modulation:
             x = x + self.attn(norm32(self.norm1, x), rope)
             return x + self.mlp(norm32(self.norm2, x))
         mod = (mod + self.shift_table.astype(mod.dtype))[:, None]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mx.split(mod, 6, axis=-1)
-        x = x + self.attn(norm_mod(x, scale_msa, shift_msa), rope, mask) * gate_msa
+        x = x + self.attn(norm_mod(x, scale_msa, shift_msa), rope, mask, mask_start) * gate_msa
         return x + self.mlp(norm_mod(x, scale_mlp, shift_mlp)) * gate_mlp
 
 
@@ -546,7 +552,7 @@ class LatentSeqMMFlowModel(nn.Module):
         h_x, h_cam, t_emb, t_mod = stream
         h = mx.concatenate([h_x, h_cond, h_cam], axis=1)
         for repo, block in zip(self.repo_layers, self.blocks):
-            h = block(h, t_mod, repo(h), mask)
+            h = block(h, t_mod, repo(h), mask, h_x.shape[1])    # the mask (key bias) is zero on the latent tokens
 
         h_x = mx.fast.layer_norm(h[:, :h_x.shape[1]].astype(F32), None, None, 1e-5)
         h_cam = mx.fast.layer_norm(h[:, -h_cam.shape[1]:].astype(F32), None, None, 1e-5)
