@@ -46,6 +46,17 @@ def test_attention_kernel():
         assert rel(ref, out) < 1e-3, (L, rel(ref, out))   # FP16 output rounding
 
 
+def test_attention_query_subset():
+    B, H, L, D = 2, 16, 300, 64     # queries: the first 200 and the last token; every token stays a key and value
+    qkv = mx.random.normal((B, L, 3, H, D)).astype(mx.float16)
+    q, k = [(mx.random.normal((B, H, L, D)) * 2).astype(mx.float16) for _ in range(2)]
+    bias = mx.random.uniform(-3, 3, (L,)).astype(mx.float16)
+    for kb in (None, bias):
+        full = mlx_dit.attention(q, k, qkv, 0.125, kb)
+        sub = mlx_dit.attention(mx.concatenate([q[:, :, :200], q[:, :, -1:]], axis=2), k, qkv, 0.125, kb)
+        assert bool(mx.array_equal(sub, mx.concatenate([full[:, :200], full[:, -1:]], axis=1)))
+
+
 def test_repo_kernels():
     repo = mlx_dit.RePo3DRotaryEmbedding(1024, 16, 64)
     for f in ('freqs_0', 'freqs_1', 'freqs_2'):
@@ -103,6 +114,7 @@ def test_linear_full_fp32():
 if __name__ == '__main__':
     test_rope_rmsnorm_kernel()
     test_attention_kernel()
+    test_attention_query_subset()
     test_repo_kernels()
     test_norm_mod_kernel()
     test_gemm_bias_kernel()
