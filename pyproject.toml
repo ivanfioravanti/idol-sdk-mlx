@@ -17,11 +17,18 @@ dependencies = [
     "pillow>=10.0",
     "plyfile>=1.0",
     "tqdm>=4.66",
+    "mlx>=0.29; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
 [project.optional-dependencies]
-demo = ["gradio==5.49.1", "spaces"]
-mlx = ["mlx>=0.29"]
+demo = ["gradio==5.49.1"]
+
+# uv: a plain `uv sync` / `uv run` also installs the demo's Gradio (`--no-default-groups` for the library only)
+[dependency-groups]
+demo = ["idol[demo]"]
+
+[tool.uv]
+default-groups = ["demo"]
 
 [build-system]
 requires = ["hatchling"]

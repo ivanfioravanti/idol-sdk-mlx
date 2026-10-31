@@ -33,7 +33,9 @@ Each pair: the input image and the generated object turning. The
 ## Install
 
 ```bash
-pip install -e .              # Python >= 3.10, PyTorch >= 2.5
+uv sync                       # Python >= 3.10: PyTorch, MLX (Apple Silicon) and Gradio for the demo
+# or with pip:
+pip install -e .              # PyTorch >= 2.5, and MLX on Apple Silicon
 pip install -e ".[demo]"      # + Gradio, to run the demo locally
 ```
 
@@ -106,8 +108,8 @@ the 50-step loop that takes ~95% of a request, runs in [MLX](https://github.com/
 image, about 2 s together.
 
 ```bash
-pip install -e ".[mlx]"
-python -m idol.sample --image photo.jpg --backend mlx
+uv sync                       # or: pip install -e .
+uv run python -m idol.sample --image photo.jpg --backend mlx
 ```
 
 ```python
@@ -187,8 +189,8 @@ dtype (FP16), hence the two-token log-count bias above.
 ### Gradio demo on Apple Silicon
 
 ```bash
-pip install -e ".[mlx,demo]"
-cd demo && python app.py          # http://127.0.0.1:7862
+uv sync                           # or: pip install -e ".[demo]"
+cd demo && uv run python app.py   # http://127.0.0.1:7862
 ```
 
 The model loads on the first Generate (MLX denoiser, everything else on MPS) and stays loaded; requests run one at a
