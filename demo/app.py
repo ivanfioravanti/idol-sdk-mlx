@@ -194,10 +194,10 @@ div.sl-section { font-weight: 700 !important; }
   #sl-meta-spacer { display: none !important; }
 }
 """
-# Runs once when the page loads. Three jobs: (1) file requests carry the session cookies: the splat viewer fetches
+# Runs once when the page loads. Four jobs: (1) file requests carry the session cookies: the splat viewer fetches
 # the .ply with `credentials: "omit"`, which a private Space answers with a 404, so the generated object never
-# appeared; (2) each loaded splat opens zoomed in by VIEWER_ZOOM; (3) dark by default; the header toggle flips
-# gradio's `dark` class and remembers the choice.
+# appeared; (2) each loaded splat opens zoomed in by VIEWER_ZOOM; (3) the viewer redraws only while it has something
+# to show; (4) dark by default; the header toggle flips gradio's `dark` class and remembers the choice.
 THEME_JS = """() => {
   const VIEWER_ZOOM = VIEWER_ZOOM_VALUE;
   const originalFetch = window.fetch.bind(window);
@@ -206,14 +206,43 @@ THEME_JS = """() => {
     if (url.includes('/gradio_api/file=')) options = Object.assign({}, options, { credentials: 'same-origin' });
     // the splat viewer fetches the .ply right after creating its orbit camera (radius 5): zoom that camera in with
     // one wheel step. Its wheel handler does radius += deltaY * 0.025 * (0.1 + 0.9 * (radius - 0.1) / 29.9).
-    const canvas = document.querySelector('#result canvas');
-    if (canvas && url.split('?')[0].endsWith('.ply')) {
+    const canvas = document.querySelector('#result canvas'), ply = url.split('?')[0].endsWith('.ply');
+    if (ply) wake(10000);    // long enough to download, parse, sort and draw a new splat
+    if (canvas && ply) {
       const startRadius = 5, targetRadius = startRadius / VIEWER_ZOOM;
       const wheelScale = 0.025 * (0.1 + 0.9 * (startRadius - 0.1) / 29.9);
       canvas.dispatchEvent(new WheelEvent('wheel', { deltaY: (targetRadius - startRadius) / wheelScale, cancelable: true }));
     }
     return originalFetch(resource, options);
   };
+  // gradio's splat viewer redraws every display frame (120 Hz on ProMotion) even when nothing moves, and that GPU work
+  // slows the local generation. Its frame callback (`…update(),….render(…),…=requestAnimationFrame(…)`) is parked
+  // while idle and woken by viewer input or a new .ply; any other requestAnimationFrame user runs as before.
+  const raf = window.requestAnimationFrame.bind(window), caf = window.cancelAnimationFrame.bind(window);
+  const isViewerLoop = new WeakMap(), parked = new Map();
+  let awakeUntil = 0, parkedId = 1e9;
+  const wake = (ms) => {
+    awakeUntil = Math.max(awakeUntil, performance.now() + ms);
+    parked.forEach((cb) => raf(cb));
+    parked.clear();
+  };
+  window.requestAnimationFrame = (cb) => {
+    let viewer = isViewerLoop.get(cb);
+    if (viewer === undefined) {
+      const src = String(cb);
+      viewer = src.includes('.render(') && src.includes('.update()') && src.includes('requestAnimationFrame');
+      isViewerLoop.set(cb, viewer);
+    }
+    if (!viewer || performance.now() < awakeUntil) return raf(cb);
+    parked.set(++parkedId, cb);
+    return parkedId;
+  };
+  window.cancelAnimationFrame = (id) => (parked.delete(id) ? undefined : caf(id));
+  const onViewer = (e) => e.target.closest && e.target.closest('#result');
+  ['pointerdown', 'wheel', 'touchstart', 'touchmove'].forEach((type) =>
+    document.addEventListener(type, (e) => { if (onViewer(e)) wake(2000); }, { capture: true, passive: true }));
+  document.addEventListener('pointermove', (e) => { if (e.buttons && onViewer(e)) wake(2000); },
+                            { capture: true, passive: true });
   const set = (dark) => { document.body.classList.toggle('dark', dark); localStorage.setItem('sl-theme', dark ? 'dark' : 'light'); };
   set(localStorage.getItem('sl-theme') !== 'light');
   window.setInterval(() => {
