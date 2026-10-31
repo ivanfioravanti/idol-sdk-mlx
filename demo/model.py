@@ -1,3 +1,4 @@
+import contextvars
 import json
 import os
 import sys
@@ -40,8 +41,10 @@ def generate(image, mode, steps, cfg_strength, rescale_t, seed, num_gaussians):
     started = time.perf_counter()
     load_seconds = None
     if pipeline is None:
-        pipeline = IdolPipeline.from_pretrained(
-            os.environ.get("IDOL_WEIGHTS", "speridlabs/idol"),
+        # in an empty context, so Gradio's track_tqdm doesn't show the loading bars: the hub's download bars never
+        # close and would sit on the progress row at 0/0 B for the whole first run
+        pipeline = contextvars.Context().run(
+            IdolPipeline.from_pretrained, os.environ.get("IDOL_WEIGHTS", "speridlabs/idol"),
             device="mps", backend="mlx", optimize=False,
         )
         load_seconds = time.perf_counter() - started

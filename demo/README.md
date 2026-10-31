@@ -23,9 +23,9 @@ Silicon with the MLX backend. `app.py` owns the UI; `model.py` calls the pipelin
 From the repository root:
 
 ```bash
-pip install -e ".[mlx,demo]"
+uv sync                    # or: pip install -e ".[demo]"
 cd demo
-HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 GRADIO_ANALYTICS_ENABLED=False python app.py   # http://127.0.0.1:7862
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 GRADIO_ANALYTICS_ENABLED=False uv run python app.py   # http://127.0.0.1:7862
 ```
 
 `model.py` imports `idol` from this repository and refuses any other installed copy. Do not install
