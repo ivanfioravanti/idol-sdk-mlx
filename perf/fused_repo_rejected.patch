@@ -1,0 +1,82 @@
+diff --git a/idol/mlx_dit.py b/idol/mlx_dit.py
+index 42ef033..1c1a37e 100644
+--- a/idol/mlx_dit.py
++++ b/idol/mlx_dit.py
+@@ -2,6 +2,7 @@
+ Same module tree and parameter names as the torch model, so it loads denoiser.safetensors as is. The image encoders
+ and the decoders stay in torch; sample_flow takes and returns torch TensorDicts."""
+ import math
++import os
+ 
+ import mlx.core as mx
+ import mlx.nn as nn
+@@ -13,6 +14,7 @@ from tqdm import tqdm
+ from .models.layers import PcdAbsolutePositionEmbedder
+ 
+ F16, F32 = mx.float16, mx.float32
++FUSED_REPO = os.environ.get('IDOL_MLX_FUSED_REPO', '1') == '1'   # RePo angles computed in the rope kernel
+ 
+ 
+ def tf32_split(a):
+@@ -66,11 +68,7 @@ def norm32(norm, x):
+ # layers.apply_rotary_emb then MultiHeadRMSNorm on q and k, fused: one SIMD group per (token, head, q or k), one
+ # thread per rotation pair. Rotates in FP32 and rounds to FP16 (torch's type_as), normalises in FP32, and writes the
+ # [B, H, L, D] layout SDPA takes. As separate MLX ops this was ~30% of a block for memory-bound work.
+-_rope_rmsnorm_kernel = mx.fast.metal_kernel(
+-    name='idol_rope_rmsnorm',
+-    input_names=['qkv', 'ang', 'gamma_q', 'gamma_k'],
+-    output_names=['q', 'k'],
+-    source="""
++_rope_rmsnorm_kernel_source = """
+     uint i = thread_position_in_grid.x;               // rotation pair: elements 2i, 2i + 1 of the 64-wide head
+     uint H = gamma_q_shape[0];
+     uint which = thread_position_in_grid.y / H;       // 0: q, 1: k
+@@ -93,13 +91,34 @@ _rope_rmsnorm_kernel = mx.fast.metal_kernel(
+         k[dst] = half(y0 / norm * gamma_k[g] * 8.0f);
+         k[dst + 1] = half(y1 / norm * gamma_k[g + 1] * 8.0f);
+     }
+-""")
++"""
++_rope_rmsnorm_kernel = mx.fast.metal_kernel(name='idol_rope_rmsnorm', input_names=['qkv', 'ang', 'gamma_q', 'gamma_k'],
++                                            output_names=['q', 'k'], source=_rope_rmsnorm_kernel_source)
++
++
++# Same kernel, but the rotation angles are computed in it from the RePo layer's per-(token, head, axis) deltas:
++# ang = clamp_mul(delta, f) * pi with tanh(f) and f - tanh(f) precomputed, so the [B, L, H, 32] FP32 angle tensor
++# and the ops that build it are skipped.
++_rope_rmsnorm_delta_kernel = mx.fast.metal_kernel(
++    name='idol_rope_rmsnorm_delta',
++    input_names=['qkv', 'delta', 'f_t', 'f_d', 'gamma_q', 'gamma_k'],
++    output_names=['q', 'k'],
++    source=_rope_rmsnorm_kernel_source.replace(
++        "float a = ang[(t * H + h) * 32 + i];",
++        "uint axis = i < AXIS1 ? 0 : (i < AXIS2 ? 1 : 2);\n"
++        "    float x = delta[(t * H + h) * 3 + axis];\n"
++        "    float a = (x * f_t[i] + x * f_d[i]) * float(M_PI_F);"))
+ 
+ 
+ def rope_rmsnorm(qkv, ang, gamma_q, gamma_k):
+     """qkv [B, L, 3, H, 64] FP16, ang [B, L, H, 32] FP32 -> rotated, RMS-normalised q, k, each [B, H, L, 64] FP16"""
+     B, L, _, H, D = qkv.shape
+     assert D == 64 and qkv.dtype == F16
++    if isinstance(ang, tuple):   # (delta [B, L, H * 3], tanh(f), f - tanh(f), first index of axis 1, of axis 2)
++        delta, f_t, f_d, a1, a2 = ang
++        return _rope_rmsnorm_delta_kernel(inputs=[qkv, delta, f_t, f_d, gamma_q, gamma_k], grid=(32, 2 * H, B * L),
++                                          threadgroup=(32, 8, 1), output_shapes=[(B, H, L, D)] * 2,
++                                          output_dtypes=[F16] * 2, template=[('AXIS1', a1), ('AXIS2', a2)])
+     return _rope_rmsnorm_kernel(inputs=[qkv, ang, gamma_q, gamma_k], grid=(32, 2 * H, B * L), threadgroup=(32, 8, 1),
+                                 output_shapes=[(B, H, L, D)] * 2, output_dtypes=[F16] * 2)
+ 
+@@ -159,6 +178,12 @@ class RePo3DRotaryEmbedding(nn.Module):
+         gate_content = matmul32(h, mx.concatenate([self.gate_map.weight, self.content_map.weight]))   # one matmul
+         gate, content = mx.split(gate_content, 2, axis=-1)
+         out = self.final_map(nn.silu(gate) * content)
++        if FUSED_REPO:
++            freqs = (self.freqs_0, self.freqs_1, self.freqs_2)
++            f = mx.concatenate(freqs)
++            f_t = mx.tanh(f)
++            n0, n1 = freqs[0].shape[0], freqs[1].shape[0]
++            return out, f_t, f - f_t, n0, n0 + n1
+         B, L, _ = out.shape
+         delta = out.reshape(B, L, self.num_heads, 3, 1)
+         ang = mx.concatenate([clamp_mul(delta[..., i, :], f) * math.pi
