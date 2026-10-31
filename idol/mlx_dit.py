@@ -229,14 +229,122 @@ _ATTN_SOURCE = """
         }
     }
 """
-_attn_kernels = {
-    with_bias: mx.fast.metal_kernel(
-        name=f'idol_attention{"_bias" if with_bias else ""}',
+# The same flash attention for M5 and later, on the Neural Accelerators: Metal 4 tensor ops (MetalPerformancePrimitives
+# matmul2d) instead of simdgroup_matrix, which on M5 runs ~3x slower than MLX's NAX SDPA; with this kernel a denoising
+# step is ~5% faster than with that one (no layout copies either). Per simdgroup 16 query rows: S = Q K^T as one 16x32x64 op, P V as one
+# 16x64x32 op, both reading K / V straight from device memory, P passed in registers from one op to the next. P goes
+# in FP16: FP32 operands are truncated to TF32 by the accelerators (MLX's choice, 4x this kernel's error before the
+# output rounding), FP16 costs nothing. Scores, softmax and accumulation in FP32.
+_NAX_ATTN_HEADER = """
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace mpp::tensor_ops;
+"""
+_NAX_ATTN_SOURCE = """
+    using ext = metal::dextents<int32_t, 2>;
+    using strides = metal::array<int32_t, 2>;
+    using dtensor = metal::tensor<device half, ext, metal::tensor_inline>;
+    constexpr int D = 64, BQ = 64, BK = 32;
+    const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+    const int qb = threadgroup_position_in_grid.x, h = threadgroup_position_in_grid.y, b = threadgroup_position_in_grid.z;
+    const int H = q_shape[1], L = q_shape[2], HD = H * D;
+    const short fn = (((lane >> 2) & 2) | (lane & 1)) * 4;
+    const float scale = scale_[0] * M_LOG2E_F;
+
+    dtensor tQ((device half*)q + (long)(b * H + h) * L * D, ext(D, L), strides{1, D});
+    dtensor tK((device half*)k + (long)(b * H + h) * L * D, ext(D, L), strides{1, D});
+    dtensor tV((device half*)qkv + (long)b * L * 3 * HD + 2 * HD + h * D, ext(D, L), strides{1, 3 * HD});
+    dtensor tO(out + (long)b * L * HD + h * D, ext(D, L), strides{1, HD});
+
+    // relaxed precision: the mode where a score tile converts in registers into the left operand of P V
+    constexpr auto dqk = matmul2d_descriptor(16, BK, D, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto dpv = matmul2d_descriptor(16, D, BK, false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<dqk, metal::execution_simdgroup> qk;
+    matmul2d<dpv, metal::execution_simdgroup> pv;
+
+    const int row0 = qb * BQ + sg * 16;
+    if (row0 >= L) return;
+    const bool qfull = row0 + 16 <= L;
+    auto Qc = qk.get_left_input_cooperative_tensor<half, half, float>();
+    if (qfull) Qc.load(tQ.slice<D, 16>(0, row0)); else Qc.load(tQ.slice(0, row0));
+    using qct_t = metal::remove_addrspace_t<decltype(Qc)>;
+    using kslice_t = decltype(tK.slice<D, BK>(0, 0));
+    using vslice_t = decltype(tV.slice<D, BK>(0, 0));
+    using pct_t = decltype(pv.get_left_input_cooperative_tensor<half, half, float>(
+        metal::declval<thread decltype(qk.get_destination_cooperative_tensor<qct_t, kslice_t, half>())&>()));
+    auto Oc = pv.get_destination_cooperative_tensor<metal::remove_addrspace_t<pct_t>, vslice_t, float>();
+    for (uint16_t i = 0; i < Oc.get_capacity(); i++) Oc[i] = 0;
+    float m[2] = {-FLT_MAX, -FLT_MAX}, s[2] = {0, 0};
+
+    // score / output tile element i: column (i / 8) * 16 + fn + i % 4 of row fm + (i / 4) % 2 * 8, fm = this lane's row
+    for (int kb = 0; kb * BK < L; kb++) {
+        const bool tail = (kb + 1) * BK > L;
+        auto Sc = qk.get_destination_cooperative_tensor<qct_t, kslice_t, float>();
+        for (uint16_t i = 0; i < Sc.get_capacity(); i++) Sc[i] = 0;
+        if (!tail) { auto ks = tK.slice<D, BK>(0, kb * BK); qk.run(Qc, ks, Sc); }
+        else { auto ks = tK.slice(0, kb * BK); qk.run(Qc, ks, Sc); }
+
+        float mx_[2] = {m[0], m[1]}, f[2], sum[2] = {0, 0};
+        for (int i = 0; i < BK / 2; i++) {
+            float e = Sc[i] * scale;
+            const int col = kb * BK + (i / 8) * 16 + fn + i % 4;
+            KEY_BIAS
+            if (tail && col >= L) e = -FLT_MAX;
+            Sc[i] = e;
+            mx_[i / 4 % 2] = metal::max(mx_[i / 4 % 2], e);
+        }
+        for (int r = 0; r < 2; r++) {
+            mx_[r] = metal::max(mx_[r], simd_shuffle_xor(mx_[r], 1));      // the 4 lanes holding a row
+            mx_[r] = metal::max(mx_[r], simd_shuffle_xor(mx_[r], 8));
+            f[r] = fast::exp2(m[r] - mx_[r]);
+            m[r] = mx_[r];
+        }
+        auto Ph = qk.get_destination_cooperative_tensor<qct_t, kslice_t, half>();
+        for (int i = 0; i < BK / 2; i++) {
+            const float p = fast::exp2(Sc[i] - mx_[i / 4 % 2]);
+            Ph[i] = half(p);
+            sum[i / 4 % 2] += p;
+        }
+        for (int r = 0; r < 2; r++) {
+            sum[r] += simd_shuffle_xor(sum[r], 1);
+            sum[r] += simd_shuffle_xor(sum[r], 8);
+            s[r] = s[r] * f[r] + sum[r];
+        }
+        for (int i = 0; i < D / 2; i++) Oc[i] *= f[i / 4 % 2];
+        auto Pc = pv.get_left_input_cooperative_tensor<half, half, float>(Ph);
+        if (!tail) { auto vs = tV.slice<D, BK>(0, kb * BK); pv.run(Pc, vs, Oc); }
+        else { auto vs = tV.slice(0, kb * BK); pv.run(Pc, vs, Oc); }
+    }
+
+    const float inv[2] = {1.0f / s[0], 1.0f / s[1]};
+    auto Oh = pv.get_destination_cooperative_tensor<metal::remove_addrspace_t<pct_t>, vslice_t, half>();
+    for (int i = 0; i < D / 2; i++) Oh[i] = half(Oc[i] * inv[i / 4 % 2]);
+    if (qfull) { auto os = tO.slice<D, 16>(0, row0); Oh.store(os); } else { auto os = tO.slice(0, row0); Oh.store(os); }
+"""
+
+
+def _unrolled(src):
+    """Every loop but the key-block loop fully unrolled: the tiles must stay in registers (~8x slower if not)."""
+    return src.replace('for (', '_Pragma("clang loop unroll(full)") for (').replace(
+        '_Pragma("clang loop unroll(full)") for (int kb', 'for (int kb')
+
+
+def _attn_kernel(nax, with_bias):
+    if nax:
+        source = _unrolled(_NAX_ATTN_SOURCE)
+        bias = 'e += M_LOG2E_F * float(key_bias[metal::min(col, L - 1)]);'
+    else:
+        source = _ATTN_SOURCE
+        bias = ('e[0] += M_LOG2E_F * float(key_bias[metal::min(col, L - 1)]);\n'
+                '                e[1] += M_LOG2E_F * float(key_bias[metal::min(col + 1, L - 1)]);')
+    return mx.fast.metal_kernel(
+        name=f'idol_attention{"_nax" if nax else ""}{"_bias" if with_bias else ""}',
         input_names=['q', 'k', 'qkv', 'scale_'] + (['key_bias'] if with_bias else []), output_names=['out'],
-        source=_ATTN_SOURCE.replace('KEY_BIAS', 'e[0] += M_LOG2E_F * float(key_bias[metal::min(col, L - 1)]);\n'
-                                                '                e[1] += M_LOG2E_F * float(key_bias[metal::min(col + 1, L - 1)]);'
-                                    if with_bias else ''))
-    for with_bias in (False, True)}
+        source=source.replace('KEY_BIAS', bias if with_bias else ''), header=_NAX_ATTN_HEADER if nax else '')
+
+
+# MLX rounds FP32 matmul operands to TF32 exactly where it runs them on the Neural Accelerators (M5 and later)
+NEURAL_ACCELERATORS = not FP32_MATMUL_EXACT
+_attn_kernels = {with_bias: _attn_kernel(NEURAL_ACCELERATORS, with_bias) for with_bias in (False, True)}
 
 
 def attention(q, k, qkv, scale, key_bias=None):
