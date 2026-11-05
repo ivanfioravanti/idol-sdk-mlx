@@ -347,7 +347,8 @@ _ATTN_SOURCE = """
 # step is ~5% faster than with that one (no layout copies either). Per simdgroup 16 query rows: S = Q K^T as one 16x32x64 op, P V as one
 # 16x64x32 op, both reading K / V straight from device memory, P passed in registers from one op to the next. P goes
 # in FP16: FP32 operands are truncated to TF32 by the accelerators (MLX's choice, 4x this kernel's error before the
-# output rounding), FP16 costs nothing. Scores, softmax and accumulation in FP32.
+# output rounding), FP16 costs nothing. Scores, softmax and accumulation in FP32. LQ queries and L keys, as in the
+# simdgroup kernel: the last block does not query the image tokens.
 _NAX_ATTN_HEADER = """
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace mpp::tensor_ops;
@@ -359,14 +360,14 @@ _NAX_ATTN_SOURCE = """
     constexpr int D = 64, BQ = 64, BK = 32;
     const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     const int qb = threadgroup_position_in_grid.x, h = threadgroup_position_in_grid.y, b = threadgroup_position_in_grid.z;
-    const int H = q_shape[1], L = q_shape[2], HD = H * D;
+    const int H = q_shape[1], LQ = q_shape[2], L = k_shape[2], HD = H * D;     // LQ queries, L keys
     const short fn = (((lane >> 2) & 2) | (lane & 1)) * 4;
     const float scale = scale_[0] * M_LOG2E_F;
 
-    dtensor tQ((device half*)q + (long)(b * H + h) * L * D, ext(D, L), strides{1, D});
+    dtensor tQ((device half*)q + (long)(b * H + h) * LQ * D, ext(D, LQ), strides{1, D});
     dtensor tK((device half*)k + (long)(b * H + h) * L * D, ext(D, L), strides{1, D});
     dtensor tV((device half*)qkv + (long)b * L * 3 * HD + 2 * HD + h * D, ext(D, L), strides{1, 3 * HD});
-    dtensor tO(out + (long)b * L * HD + h * D, ext(D, L), strides{1, HD});
+    dtensor tO(out + (long)b * LQ * HD + h * D, ext(D, LQ), strides{1, HD});
 
     // relaxed precision: the mode where a score tile converts in registers into the left operand of P V
     constexpr auto dqk = matmul2d_descriptor(16, BK, D, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
@@ -375,8 +376,8 @@ _NAX_ATTN_SOURCE = """
     matmul2d<dpv, metal::execution_simdgroup> pv;
 
     const int row0 = qb * BQ + sg * 16;
-    if (row0 >= L) return;
-    const bool qfull = row0 + 16 <= L;
+    if (row0 >= LQ) return;
+    const bool qfull = row0 + 16 <= LQ;
     auto Qc = qk.get_left_input_cooperative_tensor<half, half, float>();
     if (qfull) Qc.load(tQ.slice<D, 16>(0, row0)); else Qc.load(tQ.slice(0, row0));
     using qct_t = metal::remove_addrspace_t<decltype(Qc)>;
