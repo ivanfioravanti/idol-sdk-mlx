@@ -44,12 +44,127 @@ def matmul32(x, w):
     return x_hi @ w_hi + (x_hi @ w_lo + x_lo @ w_hi)
 
 
+# FP16 GEMM + bias, x [M, K] @ w [K, N] + b: the block linears' shapes (M ~8k-12k, K 1024 / 4096, N 1024-4096) run
+# 4-10% faster than mx.addmm, whose tile for them is 64 x 64 with 2 simdgroups and a K step of 16. Here 64 x 64 with 4
+# simdgroups of 32 x 32 and a K step of 32: half the barriers per K, more simdgroups to hide the loads. The same
+# 8x8 MMAs accumulate in FP32 over k in the same order, and the bias is added in FP32 before rounding, as in MLX's
+# addmm epilogue: the output is bit-identical to mx.addmm.
+_GEMM_SOURCE = """
+    constexpr int WM = 2, WN = 2, FI = 4, FJ = 4, BK = 32, BM = WM * FI * 8, BN = WN * FJ * 8, LDA = BK + 8, LDB = BN + 8;
+    constexpr int NT = WM * WN * 32;
+    threadgroup half As[BM * LDA];
+    threadgroup half Bs[BK * LDB];
+    const int M = x_shape[0], K = x_shape[1], N = w_shape[1];
+    const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup, tid = sg * 32 + lane;
+    const int sm = sg / WN, sn = sg % WN;
+    const int m0 = threadgroup_position_in_grid.y * BM, n0 = threadgroup_position_in_grid.x * BN;
+    const short fm = (lane / 4 & 4) + (lane / 2) % 4, fn = (lane / 4 & 2) * 2 + (lane % 2) * 2;
+
+    simdgroup_float8x8 C[FI][FJ];
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < FI; i++)
+        _Pragma("clang loop unroll(full)") for (int j = 0; j < FJ; j++) C[i][j] = simdgroup_float8x8(0);
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (int p = 0; p < BM * BK / 8 / NT; p++) {      // 8 halfs (16 bytes) per thread and pass
+            const int e = p * NT + tid, r = e / (BK / 8), c = e % (BK / 8) * 8;
+            *(threadgroup uint4*)(As + r * LDA + c) = *(const device uint4*)(x + (long)metal::min(m0 + r, M - 1) * K + k0 + c);
+        }
+        #pragma clang loop unroll(full)
+        for (int p = 0; p < BK * BN / 8 / NT; p++) {
+            const int e = p * NT + tid, r = e / (BN / 8), c = e % (BN / 8) * 8;
+            *(threadgroup uint4*)(Bs + r * LDB + c) = *(const device uint4*)(w + (long)(k0 + r) * N + n0 + c);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (int kk = 0; kk < BK / 8; kk++) {
+            simdgroup_half8x8 bf[FJ];
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < FJ; j++) simdgroup_load(bf[j], Bs + kk * 8 * LDB + sn * FJ * 8 + j * 8, LDB);
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < FI; i++) {
+                simdgroup_half8x8 af;
+                simdgroup_load(af, As + (sm * FI * 8 + i * 8) * LDA + kk * 8, LDA);
+                _Pragma("clang loop unroll(full)") for (int j = 0; j < FJ; j++) simdgroup_multiply_accumulate(C[i][j], af, bf[j], C[i][j]);
+            }
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < FI; i++) {
+        const int r = m0 + sm * FI * 8 + i * 8 + fm;
+        if (r >= M) continue;
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < FJ; j++) {
+            const int c = n0 + sn * FJ * 8 + j * 8 + fn;
+            thread auto& e = C[i][j].thread_elements();
+            EPILOGUE
+        }
+    }
+"""
+# Epilogues, each the FP16 op sequence of the MLX ops it replaces, every op rounded to FP16 (no FMA contraction; MLX's
+# tanh of FP16 runs in FP32), so the output stays bit-identical: y = addmm; gelu: nn.GELU(approx='tanh'),
+# 0.5 * y * (1 + tanh(sqrt(2 / pi) * (y + 0.044715 * y ** 3))); gate_res: res + y * gate.
+_GEMM_EPILOGUES = {
+    'bias': ('', 'const half y = half(e[t] + float(b[c + t]));'),
+    'gelu': ('', """const half y = half(e[t] + float(b[c + t]));
+                const half a = half(0.5h) * y, cube = metal::pow(y, half(3.0h));
+                const half inner = half(0.7978845608028654h) * (y + half(0.044715h) * cube);
+                y_out = a * (half(1.0h) + half(metal::precise::tanh(float(inner))));"""),
+    'gate_res': ('const long gi = (long)(r / res_shape[1]) * N;',
+                 'const half y = half(e[t] + float(b[c + t]));\n                y_out = res[(long)r * N + c + t] + y * gate[gi + c + t];'),
+}
+
+
+def _gemm_epilogue(name):
+    pre, body = _GEMM_EPILOGUES[name]
+    if 'y_out' not in body:
+        body += ' y_out = y;'
+    return f"""{pre}
+            half2 o;
+            #pragma clang loop unroll(full)
+            for (int t = 0; t < 2; t++) {{
+                #pragma METAL fp contract(off)
+                half y_out;
+                {body}
+                o[t] = y_out;
+            }}
+            *(device half2*)(out + (long)r * N + c) = o;"""
+
+
+_gemm_kernels = {
+    name: mx.fast.metal_kernel(name=f'idol_gemm_{name}', input_names=['x', 'w', 'b'] + (['gate', 'res'] if name == 'gate_res' else []),
+                               output_names=['out'], source=_GEMM_SOURCE.replace('EPILOGUE', _gemm_epilogue(name)))
+    for name in _GEMM_EPILOGUES}
+
+
+def gemm_bias(x, w, b, epilogue='bias', gate=None, res=None):
+    """x [..., K] @ w [K, N] + b, FP16 (K % 32 == 0, N % 64 == 0); bit-identical to mx.addmm(b, x, w). epilogue 'gelu':
+    then nn.GELU(approx='tanh'); 'gate_res': res + (x @ w + b) * gate, x and res [B, L, ...], gate [B, 1, N]"""
+    K, N = w.shape
+    M = x.size // K
+    extra = [gate, res] if epilogue == 'gate_res' else []
+    out = _gemm_kernels[epilogue](inputs=[x.reshape(M, K), w, b] + extra, grid=(N // 64 * 128, (M + 63) // 64, 1),
+                                  threadgroup=(128, 1, 1), output_shapes=[(M, N)], output_dtypes=[F16])[0]
+    return out.reshape(*x.shape[:-1], N)
+
+
 class Linear(nn.Linear):
     """nn.Linear, at full precision for FP32 inputs (matmul32). FP16 is exact in TF32 as is. After
-    LatentSeqMMFlowModel.to_f16() the weight is held as weight_t [in, out], contiguous: MLX's GEMM is ~5% faster on it
-    than on the weight.T view."""
+    LatentSeqMMFlowModel.to_f16() the weight is held as weight_t [in, out], contiguous (MLX's GEMM is ~5% faster on it
+    than on the weight.T view), and FP16 inputs with a bias run gemm_bias, except where K is large for the output
+    on the shapes where MLX's addmm takes its large-GEMM tiles (M N >= 2^20 and K <= 2 max(M, N)): it sums the small
+    ones (the two-token unconditional image tokens) in another order, and they cost nothing."""
+    @staticmethod
+    def _gemm_ok(M, K, N):
+        return K % 32 == 0 and N % 64 == 0 and M * N >= 1 << 20 and K <= 2 * max(M, N)
+
     def __call__(self, x):
         if 'weight_t' in self:
+            K, N = self.weight_t.shape
+            if 'bias' in self and x.dtype == F16 and self._gemm_ok(x.size // K, K, N):
+                return gemm_bias(x, self.weight_t, self.bias)
             return mx.addmm(self.bias, x, self.weight_t) if 'bias' in self else x @ self.weight_t
         if x.dtype != F32:
             return super().__call__(x)
@@ -67,36 +182,29 @@ def norm32(norm, x):
     return norm(x.astype(F32)).astype(x.dtype)
 
 
-# layers.apply_rotary_emb then MultiHeadRMSNorm on q and k, fused: one SIMD group per (token, head, q or k), one
-# thread per rotation pair. Rotates in FP32 and rounds to FP16 (torch's type_as), normalises in FP32, and writes the
-# [B, H, L, D] layout SDPA takes. As separate MLX ops this was ~30% of a block for memory-bound work.
+# layers.apply_rotary_emb then MultiHeadRMSNorm on q and k, fused: one SIMD group per (token, head), one thread per
+# rotation pair of both q and k (one angle read, one sincos). Rotates in FP32 and rounds to FP16 (torch's type_as),
+# normalises in FP32, and writes the [B, H, L, D] layout SDPA takes. As separate MLX ops this was ~30% of a block for
+# memory-bound work.
 _rope_rmsnorm_kernel = mx.fast.metal_kernel(
     name='idol_rope_rmsnorm',
     input_names=['qkv', 'ang', 'gamma_q', 'gamma_k'],
     output_names=['q', 'k'],
     source="""
-    uint i = thread_position_in_grid.x;               // rotation pair: elements 2i, 2i + 1 of the 64-wide head
-    uint H = gamma_q_shape[0];
-    uint which = thread_position_in_grid.y / H;       // 0: q, 1: k
-    uint h = thread_position_in_grid.y % H;
-    uint t = thread_position_in_grid.z;               // b * L + token
-    uint L = qkv_shape[1];
-    uint src = ((t * 3 + which) * H + h) * 64 + 2 * i;
-    float x0 = qkv[src], x1 = qkv[src + 1];
-    float a = ang[(t * H + h) * 32 + i];
-    float c = metal::precise::cos(a), s = metal::precise::sin(a);
-    float y0 = float(half(x0 * c - x1 * s));
-    float y1 = float(half(x0 * s + x1 * c));
-    float norm = metal::max(metal::sqrt(simd_sum(y0 * y0 + y1 * y1)), 1e-12f);
-    uint g = h * 64 + 2 * i;
-    uint dst = (((t / L) * H + h) * L + t % L) * 64 + 2 * i;
-    if (which == 0) {
-        q[dst] = half(y0 / norm * gamma_q[g] * 8.0f);
-        q[dst + 1] = half(y1 / norm * gamma_q[g + 1] * 8.0f);
-    } else {
-        k[dst] = half(y0 / norm * gamma_k[g] * 8.0f);
-        k[dst + 1] = half(y1 / norm * gamma_k[g + 1] * 8.0f);
-    }
+    const uint i = thread_position_in_grid.x;         // rotation pair: elements 2i, 2i + 1 of the 64-wide head
+    const uint h = thread_position_in_grid.y, t = thread_position_in_grid.z;    // head, b * L + token
+    const uint H = gamma_q_shape[0], L = qkv_shape[1];
+    const uint src = (t * 3 * H + h) * 64 + 2 * i;
+    const half2 xq = *(const device half2*)(qkv + src), xk = *(const device half2*)(qkv + src + H * 64);
+    const float a = ang[(t * H + h) * 32 + i];
+    const float c = metal::precise::cos(a), s = metal::precise::sin(a);
+    const float q0 = float(half(float(xq[0]) * c - float(xq[1]) * s)), q1 = float(half(float(xq[0]) * s + float(xq[1]) * c));
+    const float k0 = float(half(float(xk[0]) * c - float(xk[1]) * s)), k1 = float(half(float(xk[0]) * s + float(xk[1]) * c));
+    const float nq = metal::max(metal::sqrt(simd_sum(q0 * q0 + q1 * q1)), 1e-12f);
+    const float nk = metal::max(metal::sqrt(simd_sum(k0 * k0 + k1 * k1)), 1e-12f);
+    const uint g = h * 64 + 2 * i, dst = (((t / L) * H + h) * L + t % L) * 64 + 2 * i;
+    *(device half2*)(q + dst) = half2(half(q0 / nq * gamma_q[g] * 8.0f), half(q1 / nq * gamma_q[g + 1] * 8.0f));
+    *(device half2*)(k + dst) = half2(half(k0 / nk * gamma_k[g] * 8.0f), half(k1 / nk * gamma_k[g + 1] * 8.0f));
 """)
 
 
@@ -104,29 +212,32 @@ def rope_rmsnorm(qkv, ang, gamma_q, gamma_k):
     """qkv [B, L, 3, H, 64] FP16, ang [B, L, H, 32] FP32 -> rotated, RMS-normalised q, k, each [B, H, L, 64] FP16"""
     B, L, _, H, D = qkv.shape
     assert D == 64 and qkv.dtype == F16
-    return _rope_rmsnorm_kernel(inputs=[qkv, ang, gamma_q, gamma_k], grid=(32, 2 * H, B * L), threadgroup=(32, 8, 1),
+    return _rope_rmsnorm_kernel(inputs=[qkv, ang, gamma_q, gamma_k], grid=(32, H, B * L), threadgroup=(32, 16, 1),
                                 output_shapes=[(B, H, L, D)] * 2, output_dtypes=[F16] * 2)
 
 
-# Flash attention for head_dim 64, faster here than mx.fast.scaled_dot_product_attention (27.3 -> 26.1 ms at 12,294
-# tokens, 13.1 -> 12.2 ms at 8,195 with the key bias): MLX's kernel gives each simdgroup 8 query rows and reloads Q and K
+# Flash attention for head_dim 64, faster here than mx.fast.scaled_dot_product_attention (27.3 -> 26.2 ms at 12,294
+# tokens, 13.1 -> 12.0 ms at 8,195 with the key bias): MLX's kernel gives each simdgroup 8 query rows and reloads Q and K
 # fragments from threadgroup memory for every MMA; here a simdgroup keeps 16 query rows of Q in registers, so each K / V
-# fragment feeds two MMAs. FP16 operands, FP32 scores, softmax and accumulation, the same online softmax as MLX. Reads
-# V straight from the qkv projection and writes [B, L, H * 64], the layout the output projection takes.
+# fragment feeds two MMAs. K is stored transposed in threadgroup memory ([d][key]): plain fragment loads are cheaper
+# than transposed ones. FP16 operands, FP32 scores, softmax and accumulation, the same online softmax as MLX. Reads
+# V straight from the qkv projection and writes [B, L, H * 64], the layout the output projection takes. The key bias is
+# zero before key BIAS_START (the latent tokens), so only the last key blocks add it, with the tail mask.
 _ATTN_SOURCE = """
     constexpr int D = 64, TD = 8, NSG = 4, TQ = 2, BQ = NSG * TQ * 8, BK = 32, TK = BK / 8, LD = D + 8;
-    threadgroup half Ks[BK * LD];      // K block [key][d], read transposed by simdgroup_load
+    threadgroup half Ks[D * BK];       // K block transposed [d][key]
     threadgroup half Vs[BK * LD];      // V block [key][d]
 
     const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     const int qb = threadgroup_position_in_grid.x, h = threadgroup_position_in_grid.y, b = threadgroup_position_in_grid.z;
-    const int H = q_shape[1], L = q_shape[2], HD = H * D;
+    const int H = q_shape[1], LQ = q_shape[2], L = k_shape[2], HD = H * D;     // LQ queries, L keys
     const short fm = (lane / 4 & 4) + (lane / 2) % 4, fn = (lane / 4 & 2) * 2 + (lane % 2) * 2;  // this lane's fragment row, cols
 
-    const device half* Q = q + (long)(b * H + h) * L * D;
+    const device half* Q = q + (long)(b * H + h) * LQ * D;
     const device half* K = k + (long)(b * H + h) * L * D;
     const device half* V = qkv + (long)b * L * 3 * HD + 2 * HD + h * D;    // row stride 3 * HD
     const float scale = scale_[0] * M_LOG2E_F;
+    const int kb_special = metal::min(L / BK, BIAS_START / BK);    // first key block with a bias or past L
 
     simdgroup_half8x8 Qf[TQ][TD];
     simdgroup_float8x8 Of[TQ][TD], Sf[TQ][TK];
@@ -134,7 +245,7 @@ _ATTN_SOURCE = """
     const int row0 = qb * BQ + sg * TQ * 8;
     #pragma clang loop unroll(full)
     for (int i = 0; i < TQ; i++) {
-        const int r = metal::min(row0 + i * 8 + fm, L - 1);
+        const int r = metal::min(row0 + i * 8 + fm, LQ - 1);
         #pragma clang loop unroll(full)
         for (int d = 0; d < TD; d++) {
             const half2 x = *(const device half2*)(Q + (long)r * D + d * 8 + fn);
@@ -152,7 +263,9 @@ _ATTN_SOURCE = """
         threadgroup_barrier(mem_flags::mem_threadgroup);
         #pragma clang loop unroll(full)
         for (int j = 0; j < PER; j += 4) {
-            *(threadgroup half4*)(Ks + lk * LD + ld0 + j) = key < L ? *(const device half4*)(K + (long)key * D + ld0 + j) : half4(0);
+            const half4 kv = key < L ? *(const device half4*)(K + (long)key * D + ld0 + j) : half4(0);
+            Ks[(ld0 + j) * BK + lk] = kv[0]; Ks[(ld0 + j + 1) * BK + lk] = kv[1];
+            Ks[(ld0 + j + 2) * BK + lk] = kv[2]; Ks[(ld0 + j + 3) * BK + lk] = kv[3];
             *(threadgroup half4*)(Vs + lk * LD + ld0 + j) = key < L ? *(const device half4*)(V + (long)key * 3 * HD + ld0 + j) : half4(0);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -165,12 +278,12 @@ _ATTN_SOURCE = """
             #pragma clang loop unroll(full)
             for (int c = 0; c < TK; c++) {
                 simdgroup_half8x8 kf;
-                simdgroup_load(kf, Ks + c * 8 * LD + d * 8, LD, ulong2(0, 0), true);
+                simdgroup_load(kf, Ks + d * 8 * BK + c * 8, BK);
                 _Pragma("clang loop unroll(full)") for (int i = 0; i < TQ; i++) simdgroup_multiply_accumulate(Sf[i][c], Qf[i][d], kf, Sf[i][c]);
             }
         }
 
-        const bool tail = (kb + 1) * BK > L;
+        const bool special = kb >= kb_special;
         #pragma clang loop unroll(full)
         for (int i = 0; i < TQ; i++) {
             float mx_ = m[i];
@@ -179,8 +292,8 @@ _ATTN_SOURCE = """
                 thread auto& e = Sf[i][c].thread_elements();
                 const int col = kb * BK + c * 8 + fn;
                 e[0] *= scale; e[1] *= scale;
-                KEY_BIAS
-                if (tail) {
+                if (special) {
+                    KEY_BIAS
                     if (col >= L) e[0] = -FLT_MAX;
                     if (col + 1 >= L) e[1] = -FLT_MAX;
                 }
@@ -221,11 +334,11 @@ _ATTN_SOURCE = """
     #pragma clang loop unroll(full)
     for (int i = 0; i < TQ; i++) {
         const int r = row0 + i * 8 + fm;
-        if (r >= L) continue;
+        if (r >= LQ) continue;
         #pragma clang loop unroll(full)
         for (int d = 0; d < TD; d++) {
             thread auto& e = Of[i][d].thread_elements();
-            *(device half2*)(out + ((long)b * L + r) * HD + h * D + d * 8 + fn) = half2(half(e[0] / s[i]), half(e[1] / s[i]));
+            *(device half2*)(out + ((long)b * LQ + r) * HD + h * D + d * 8 + fn) = half2(half(e[0] / s[i]), half(e[1] / s[i]));
         }
     }
 """
@@ -234,7 +347,8 @@ _ATTN_SOURCE = """
 # step is ~5% faster than with that one (no layout copies either). Per simdgroup 16 query rows: S = Q K^T as one 16x32x64 op, P V as one
 # 16x64x32 op, both reading K / V straight from device memory, P passed in registers from one op to the next. P goes
 # in FP16: FP32 operands are truncated to TF32 by the accelerators (MLX's choice, 4x this kernel's error before the
-# output rounding), FP16 costs nothing. Scores, softmax and accumulation in FP32.
+# output rounding), FP16 costs nothing. Scores, softmax and accumulation in FP32. LQ queries and L keys, as in the
+# simdgroup kernel: the last block does not query the image tokens.
 _NAX_ATTN_HEADER = """
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace mpp::tensor_ops;
@@ -246,14 +360,14 @@ _NAX_ATTN_SOURCE = """
     constexpr int D = 64, BQ = 64, BK = 32;
     const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     const int qb = threadgroup_position_in_grid.x, h = threadgroup_position_in_grid.y, b = threadgroup_position_in_grid.z;
-    const int H = q_shape[1], L = q_shape[2], HD = H * D;
+    const int H = q_shape[1], LQ = q_shape[2], L = k_shape[2], HD = H * D;     // LQ queries, L keys
     const short fn = (((lane >> 2) & 2) | (lane & 1)) * 4;
     const float scale = scale_[0] * M_LOG2E_F;
 
-    dtensor tQ((device half*)q + (long)(b * H + h) * L * D, ext(D, L), strides{1, D});
+    dtensor tQ((device half*)q + (long)(b * H + h) * LQ * D, ext(D, LQ), strides{1, D});
     dtensor tK((device half*)k + (long)(b * H + h) * L * D, ext(D, L), strides{1, D});
     dtensor tV((device half*)qkv + (long)b * L * 3 * HD + 2 * HD + h * D, ext(D, L), strides{1, 3 * HD});
-    dtensor tO(out + (long)b * L * HD + h * D, ext(D, L), strides{1, HD});
+    dtensor tO(out + (long)b * LQ * HD + h * D, ext(D, LQ), strides{1, HD});
 
     // relaxed precision: the mode where a score tile converts in registers into the left operand of P V
     constexpr auto dqk = matmul2d_descriptor(16, BK, D, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
@@ -262,8 +376,8 @@ _NAX_ATTN_SOURCE = """
     matmul2d<dpv, metal::execution_simdgroup> pv;
 
     const int row0 = qb * BQ + sg * 16;
-    if (row0 >= L) return;
-    const bool qfull = row0 + 16 <= L;
+    if (row0 >= LQ) return;
+    const bool qfull = row0 + 16 <= LQ;
     auto Qc = qk.get_left_input_cooperative_tensor<half, half, float>();
     if (qfull) Qc.load(tQ.slice<D, 16>(0, row0)); else Qc.load(tQ.slice(0, row0));
     using qct_t = metal::remove_addrspace_t<decltype(Qc)>;
@@ -335,7 +449,7 @@ def _attn_kernel(nax, with_bias):
     else:
         source = _ATTN_SOURCE
         bias = ('e[0] += M_LOG2E_F * float(key_bias[metal::min(col, L - 1)]);\n'
-                '                e[1] += M_LOG2E_F * float(key_bias[metal::min(col + 1, L - 1)]);')
+                '                    e[1] += M_LOG2E_F * float(key_bias[metal::min(col + 1, L - 1)]);')
     return mx.fast.metal_kernel(
         name=f'idol_attention{"_nax" if nax else ""}{"_bias" if with_bias else ""}',
         input_names=['q', 'k', 'qkv', 'scale_'] + (['key_bias'] if with_bias else []), output_names=['out'],
@@ -347,14 +461,16 @@ NEURAL_ACCELERATORS = not FP32_MATMUL_EXACT
 _attn_kernels = {with_bias: _attn_kernel(NEURAL_ACCELERATORS, with_bias) for with_bias in (False, True)}
 
 
-def attention(q, k, qkv, scale, key_bias=None):
-    """q, k [B, H, L, 64] FP16, qkv [B, L, 3, H, 64] FP16 (v = qkv[:, :, 2]), key_bias [L] (added to the scores) or
-    None -> softmax(q k^T * scale + key_bias) v as [B, L, H * 64] FP16"""
-    B, H, L, D = q.shape
+def attention(q, k, qkv, scale, key_bias=None, bias_start=0):
+    """q [B, H, LQ, 64], k [B, H, L, 64] FP16, qkv [B, L, 3, H, 64] FP16 (v = qkv[:, :, 2]), key_bias [L] (added to the
+    scores, zero before key bias_start) or None -> softmax(q k^T * scale + key_bias) v as [B, LQ, H * 64] FP16"""
+    B, H, L, D = k.shape
+    LQ = q.shape[2]
     assert D == 64 and q.dtype == k.dtype == qkv.dtype == F16
     inputs = [q, k, qkv, mx.array([scale], F32)] + ([key_bias] if key_bias is not None else [])
-    return _attn_kernels[key_bias is not None](inputs=inputs, grid=((L + 63) // 64 * 128, H, B), threadgroup=(128, 1, 1),
-                                               output_shapes=[(B, L, H * D)], output_dtypes=[F16])[0]
+    return _attn_kernels[key_bias is not None](inputs=inputs, grid=((LQ + 63) // 64 * 128, H, B), threadgroup=(128, 1, 1),
+                                               template=[('BIAS_START', bias_start if key_bias is not None else L)],
+                                               output_shapes=[(B, LQ, H * D)], output_dtypes=[F16])[0]
 
 
 # The two ends of a RePo layer, fused. LayerNorm of FP16 tokens in FP32 in one pass (one threadgroup per token, 4
@@ -540,11 +656,15 @@ class RopeMultiHeadAttention(nn.Module):
         self.k_norm = MultiHeadRMSNorm(self.head_dim, num_heads)
         self.out = Linear(channels, channels)
 
-    def __call__(self, x, rope, mask=None):
+    def __call__(self, x, rope, mask=None, mask_start=0, project=True, keep=None):
+        """project=False: without the output projection. keep (n, m): only the first n and the last m tokens query"""
         B, L, C = x.shape
         qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
         q, k = rope_rmsnorm(qkv, rope, self.q_norm.gamma, self.k_norm.gamma)
-        return self.out(attention(q, k, qkv, self.head_dim ** -0.5, mask))
+        if keep is not None:
+            q = mx.concatenate([q[:, :, :keep[0]], q[:, :, L - keep[1]:]], axis=2)
+        a = attention(q, k, qkv, self.head_dim ** -0.5, mask, mask_start)
+        return self.out(a) if project else a
 
 
 class UnifiedTransformerBlock(nn.Module):
@@ -558,13 +678,25 @@ class UnifiedTransformerBlock(nn.Module):
         if modulation:
             self.shift_table = mx.zeros((1, 6 * channels))
 
-    def __call__(self, x, mod, rope, mask=None):
+    def __call__(self, x, mod, rope, mask=None, mask_start=0, keep=None):
+        """keep (n, m): return only the first n and the last m tokens (the others still serve as keys and values)"""
+        def kept(t):
+            return t if keep is None else mx.concatenate([t[:, :keep[0]], t[:, t.shape[1] - keep[1]:]], axis=1)
         if not self.modulation:
+            assert keep is None
             x = x + self.attn(norm32(self.norm1, x), rope)
             return x + self.mlp(norm32(self.norm2, x))
         mod = (mod + self.shift_table.astype(mod.dtype))[:, None]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mx.split(mod, 6, axis=-1)
-        x = x + self.attn(norm_mod(x, scale_msa, shift_msa), rope, mask) * gate_msa
+        out, fc1, fc2 = self.attn.out, self.mlp.mlp[0], self.mlp.mlp[2]
+        B, L, C = x.shape
+        if x.dtype == F16 and 'weight_t' in out and all(Linear._gemm_ok(B * L, *m.weight_t.shape) for m in (out, fc1, fc2)):
+            # the gated residuals and the GELU in the GEMM epilogues (bit-identical to the unfused ops)
+            a = self.attn(norm_mod(x, scale_msa, shift_msa), rope, mask, mask_start, project=False, keep=keep)
+            x = gemm_bias(a, out.weight_t, out.bias, 'gate_res', gate_msa, kept(x))
+            h = gemm_bias(norm_mod(x, scale_mlp, shift_mlp), fc1.weight_t, fc1.bias, 'gelu')
+            return gemm_bias(h, fc2.weight_t, fc2.bias, 'gate_res', gate_mlp, x)
+        x = kept(x) + self.attn(norm_mod(x, scale_msa, shift_msa), rope, mask, mask_start, keep=keep) * gate_msa
         return x + self.mlp(norm_mod(x, scale_mlp, shift_mlp)) * gate_mlp
 
 
@@ -653,8 +785,11 @@ class LatentSeqMMFlowModel(nn.Module):
         """latent_stream() output and condition() output -> the velocity"""
         h_x, h_cam, t_emb, t_mod = stream
         h = mx.concatenate([h_x, h_cond, h_cam], axis=1)
-        for repo, block in zip(self.repo_layers, self.blocks):
-            h = block(h, t_mod, repo(h), mask)
+        n_x, n_cam = h_x.shape[1], h_cam.shape[1]
+        for i, (repo, block) in enumerate(zip(self.repo_layers, self.blocks)):
+            # the mask (key bias) is zero on the latent tokens; the last block's image-token outputs are not used, so
+            # there the image tokens are only keys and values (each query row's result is independent of the others)
+            h = block(h, t_mod, repo(h), mask, n_x, keep=(n_x, n_cam) if i == len(self.blocks) - 1 else None)
 
         h_x = mx.fast.layer_norm(h[:, :h_x.shape[1]].astype(F32), None, None, 1e-5)
         h_cam = mx.fast.layer_norm(h[:, -h_cam.shape[1]:].astype(F32), None, None, 1e-5)

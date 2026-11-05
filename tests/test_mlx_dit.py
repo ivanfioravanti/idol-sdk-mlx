@@ -30,17 +30,31 @@ def test_rope_rmsnorm_kernel():
 
 def test_attention_kernel():
     B, H, D = 2, 16, 64
-    for L, with_bias in ((300, False), (77, True), (2, False)):     # lengths off the 64-query / 32-key blocks
+    # lengths off the 64-query / 32-key blocks; a bias that is zero before key bias_start (as the unconditional pass)
+    for L, with_bias, bias_start in ((300, False, 0), (77, True, 0), (2, False, 0), (300, True, 256), (300, True, 270)):
         qkv = mx.random.normal((B, L, 3, H, D)).astype(mx.float16)
         q, k = [(mx.random.normal((B, H, L, D)) * 2).astype(mx.float16) for _ in range(2)]
         bias = mx.random.uniform(-3, 3, (L,)).astype(mx.float16) if with_bias else None
+        if with_bias and bias_start:
+            bias[:bias_start] = 0
         s = (q.astype(mx.float32) @ k.astype(mx.float32).transpose(0, 1, 3, 2)) * 0.125
         if bias is not None:
             s = s + bias.astype(mx.float32)
         ref = (mx.softmax(s, axis=-1) @ qkv[:, :, 2].astype(mx.float32).transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
-        out = mlx_dit.attention(q, k, qkv, 0.125, bias).astype(mx.float32)
+        out = mlx_dit.attention(q, k, qkv, 0.125, bias, bias_start).astype(mx.float32)
         ref, out = torch.from_numpy(np.array(ref.reshape(B, L, H * D))), torch.from_numpy(np.array(out))
         assert rel(ref, out) < 1e-3, (L, rel(ref, out))   # FP16 output rounding
+
+
+def test_attention_query_subset():
+    B, H, L, D = 2, 16, 300, 64     # queries: the first 200 and the last token; every token stays a key and value
+    qkv = mx.random.normal((B, L, 3, H, D)).astype(mx.float16)
+    q, k = [(mx.random.normal((B, H, L, D)) * 2).astype(mx.float16) for _ in range(2)]
+    bias = mx.random.uniform(-3, 3, (L,)).astype(mx.float16)
+    for kb in (None, bias):
+        full = mlx_dit.attention(q, k, qkv, 0.125, kb)
+        sub = mlx_dit.attention(mx.concatenate([q[:, :, :200], q[:, :, -1:]], axis=2), k, qkv, 0.125, kb)
+        assert bool(mx.array_equal(sub, mx.concatenate([full[:, :200], full[:, -1:]], axis=1)))
 
 
 def test_repo_kernels():
@@ -65,6 +79,31 @@ def test_norm_mod_kernel():
     print('norm_mod max abs diff', float(mx.abs(out - ref).max()), 'mismatch fraction', float((out != ref).mean()))
 
 
+def test_gemm_bias_kernel():
+    for M, K, N in ((400, 1024, 3072), (1100, 1024, 1024), (2050, 4096, 1024), (300, 1024, 4096)):   # rows off the tiles
+        x = mx.random.normal((2, M, K)).astype(mx.float16)
+        w = (mx.random.normal((K, N)) * K ** -0.5).astype(mx.float16)
+        b = mx.random.normal((N,)).astype(mx.float16)
+        out = mlx_dit.gemm_bias(x, w, b)
+        assert mlx_dit.Linear._gemm_ok(2 * M, K, N)
+        assert bool(mx.array_equal(out, mx.addmm(b, x, w))), (M, K, N)   # same MMAs, same order, same epilogue
+        ref = np.array(x, np.float64) @ np.array(w, np.float64) + np.array(b, np.float64)
+        assert np.linalg.norm(np.array(out, np.float64) - ref) / np.linalg.norm(ref) < 1e-3
+
+
+def test_gemm_epilogues():
+    gelu = mlx_dit.nn.GELU(approx='tanh')
+    x = (mx.random.normal((2, 600, 1024)) * 2).astype(mx.float16)
+    res = (mx.random.normal((2, 600, 1024)) * 3).astype(mx.float16)
+    gate = (mx.random.normal((2, 1, 1024)) * 0.5).astype(mx.float16)
+    w1, w2 = [(mx.random.normal(s) * s[0] ** -0.5).astype(mx.float16) for s in ((1024, 4096), (4096, 1024))]
+    b1, b2 = [(mx.random.normal((n,)) * 0.3).astype(mx.float16) for n in (4096, 1024)]
+    h = mlx_dit.gemm_bias(x, w1, b1, 'gelu')
+    assert bool(mx.array_equal(h, mx.compile(gelu)(mx.addmm(b1, x, w1))))
+    out = mlx_dit.gemm_bias(h, w2, b2, 'gate_res', gate, res)
+    assert bool(mx.array_equal(out, mx.compile(lambda h: res + mx.addmm(b2, h, w2) * gate)(h)))
+
+
 def test_linear_full_fp32():
     layer = mlx_dit.Linear(1024, 512)
     x = mx.random.normal((4096, 1024))
@@ -75,7 +114,10 @@ def test_linear_full_fp32():
 if __name__ == '__main__':
     test_rope_rmsnorm_kernel()
     test_attention_kernel()
+    test_attention_query_subset()
     test_repo_kernels()
     test_norm_mod_kernel()
+    test_gemm_bias_kernel()
+    test_gemm_epilogues()
     test_linear_full_fp32()
     print('ok')
